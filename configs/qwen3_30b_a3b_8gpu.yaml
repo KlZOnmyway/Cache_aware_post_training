@@ -1,0 +1,116 @@
+# Cache-aware MoE distillation — Qwen3-30B-A3B / 8-GPU production config
+# ============================================================================
+# Suitable for 8 × H100-80G or 8 × 5090-32G (single node).
+# Training side: Megatron-LM with EP=8 + sequence parallel.
+# Rollout side : SGLang student (with switch_head bank) + SGLang teacher (frozen).
+# Logging      : tensorboard (./runs/<run_name>).
+# ============================================================================
+
+run_name: qwen3_30b_a3b_cache_distill_v1
+seed: 42
+output_dir: /scratch/runs/${run_name}
+tensorboard_dir: ${output_dir}/tb
+
+# ---- model ----
+model:
+  arch: qwen3_moe                               # picks slime_adapter.modeling.qwen3_moe
+  hf_checkpoint: /scratch/models/Qwen3-30B-A3B
+  ref_load: /scratch/models/Qwen3-30B-A3B_mcore # mcore-format checkpoint
+  dtype: bfloat16
+
+# ---- parallelism (Megatron) ----
+parallel:
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 8                 # split 128 experts across 8 GPUs (16 each)
+  expert_tensor_parallel_size: 1
+  context_parallel_size: 1
+  sequence_parallel: true
+  moe_token_dispatcher_type: alltoall           # 5090 = no NVLink, deepep less effective
+  recompute_granularity: selective
+  use_dynamic_batch_size: true
+  max_tokens_per_gpu: 4096
+
+# ---- controller knobs (slime_adapter) ----
+controller:
+  moe_arch: qwen3_moe
+  top_k: 2                                      # student uses top-2 (vs teacher's top-8)
+  gate_init_bias: -2.0                          # σ ≈ 0.12 cold-start (sparse switching)
+  use_pressure_input: true
+  cache_window: 16
+  cache_cap: 30
+  budget_fraction: 0.7                          # total_credits = 0.7 × num_moe_layers per token
+  chunk_size: 8                                 # for L_chunk_consist
+
+# ---- loss weights ----
+loss:
+  lambda_budget: 0.05                           # uniform per-switch cost
+  lambda_barrier: 0.5                           # token-level hinge² barrier
+  lambda_consistency: 0.05                      # chunk routing smoothness
+  router_kl_anchor: 0.0                         # optional: anchor student router to teacher
+
+# ---- rollout (SGLang) ----
+rollout:
+  prompt_data: /scratch/data/dapo-math-17k.jsonl
+  input_key: prompt
+  label_key: label
+  apply_chat_template: true
+  rollout_shuffle: true
+  rollout_batch_size: 8
+  n_samples_per_prompt: 4
+  rollout_max_response_len: 1024
+  rollout_temperature: 1.0
+  global_batch_size: 32
+  num_rollout: 1000
+  use_routing_replay: true
+  rollout_num_gpus: 8
+  rollout_num_gpus_per_engine: 4
+  disable_cuda_graph: true                      # M3: re-enable later w/ fixed-shape mask
+  rm_url: http://localhost:30001                # teacher SGLang server
+  rm_type: custom
+  custom_rm_path: slime_adapter.rollout.reward_kl:reward_func
+  rollout_function_path: slime_adapter.rollout.generate:generate_rollout
+
+# ---- GRPO/GSPO ----
+grpo:
+  advantage_estimator: gspo
+  use_tis: true
+  num_update_epochs: 1                          # strict on-policy; raise once stable
+  eps_clip: 4e-4
+  entropy_coef: 0.0
+  kl_coef: 0.0
+
+# ---- optimizer ----
+optimizer:
+  type: adam
+  lr: 1e-6                                      # router / lm_head
+  switch_head_lr: 1e-4                          # SwitchHead (small head, larger lr OK)
+  lr_decay_style: constant
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  clip_grad: 1.0
+
+# ---- distributed infra ----
+infra:
+  num_nodes: 1
+  num_gpus_per_node: 8
+  colocate: true
+  accumulate_allreduce_grads_in_fp32: true
+  attention_softmax_in_fp32: true
+  attention_backend: flash
+
+# ---- sglang specific ----
+sglang:
+  mem_fraction_static: 0.8
+  cuda_graph_max_bs: 0                          # disabled in v1
+  max_running_requests: 128
+  teacher_url: http://localhost:30001           # frozen Qwen3-30B-A3B server (top-8)
+
+# ---- logging / checkpointing ----
+logging:
+  backend: tensorboard
+  log_dir: ${tensorboard_dir}
+  log_interval: 10
+  save_interval: 100
+  save_dir: ${output_dir}/checkpoints

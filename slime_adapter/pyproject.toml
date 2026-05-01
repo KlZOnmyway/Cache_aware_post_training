@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slime_adapter"
+version = "0.1.0"
+description = "Cache-aware MoE distillation adapter for slime — switch_head + budget barrier + chunk consistency."
+requires-python = ">=3.10,<3.13"
+authors = [{ name = "rl_moe" }]
+# Inherit deps from workspace root; this package itself only needs the bits
+# the model-agnostic core uses at import time.
+dependencies = [
+    "torch>=2.5",
+    "aiohttp>=3.9",  # for reward_kl HTTP client
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff", "black"]
+
+# ---- packaging ----
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["slime_adapter*"]
+
+# ---- ruff / black inherit from workspace root via workspace lock ----

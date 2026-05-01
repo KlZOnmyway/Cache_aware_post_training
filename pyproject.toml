@@ -1,0 +1,148 @@
+# =============================================================================
+# rl_moe — uv workspace root
+# =============================================================================
+#
+# This pyproject.toml is the workspace root. It does not produce an installable
+# package by itself; the only buildable member is ``slime_adapter`` (declared
+# as a workspace member below).
+#
+# All Python dependency management goes through uv. Common workflows:
+#
+#   # one-time setup (creates .venv, locks, installs everything for training)
+#   uv sync --all-extras
+#
+#   # narrow installs by purpose
+#   uv sync --extra train         # trainer-side: slime + Megatron + transformers
+#   uv sync --extra serve         # rollout-side: sglang
+#   uv sync --extra dev           # tests + linters
+#
+#   # exact reproduce on a fresh server (uv.lock pinned)
+#   uv sync --frozen --all-extras
+#
+# Externals not on PyPI (Megatron-LM, transformer_engine, etc.) are installed
+# via ``scripts/install_externals.sh`` after ``uv sync``. See README.
+# ============================================================================
+
+[project]
+name = "rl_moe"
+version = "0.1.0"
+description = "Cache-aware MoE distillation training stack: slime + sglang + Megatron-LM."
+readme = "PORT_TO_SLIME.md"
+requires-python = ">=3.10,<3.13"
+authors = [{ name = "rl_moe" }]
+
+# Core deps that the slime_adapter package itself needs (plus our top-level
+# scripts). Heavyweight engines (slime, sglang, megatron) are installed via
+# the `train` / `serve` extras below.
+dependencies = [
+    # Workspace member — the actual package this project ships.
+    "slime_adapter",
+    # Common runtime deps used by the slime_adapter core and our scripts.
+    "torch>=2.5.0",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "aiohttp>=3.9",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# Trainer-side deps (Megatron + slime + the transformer-engine ecosystem).
+# Some of these (Megatron-LM, transformer-engine) typically need to be
+# installed from a CUDA/PyTorch-matched git or wheel index — see
+# scripts/install_externals.sh.
+train = [
+    "transformers==4.57.1",
+    "accelerate==1.11.0",
+    "datasets>=3.6.0",
+    "tensorboard>=2.16",
+    "tokenizers>=0.22.0",
+    "safetensors>=0.7.0",
+    "trl>=0.26.0",
+    "peft>=0.18.0",
+    "ray[default]>=2.45",
+    "blobfile",
+    "pylatexenc",
+    "omegaconf",
+    "pillow",
+    # slime itself (source install in scripts/install_externals.sh — kept off
+    # this list because it pins on Megatron-LM specific commits).
+]
+
+# Rollout-side deps (SGLang server + router).
+serve = [
+    "sglang-router>=0.0.34 ; python_version < '3.13'",
+    "transformers==4.57.1",
+    "tokenizers>=0.22.0",
+    # The sglang server itself is installed via scripts/install_externals.sh
+    # because it has CUDA-version-specific wheels.
+]
+
+# Dev / unit-test deps.
+dev = [
+    "pytest>=8",
+    "pytest-asyncio",
+    "ruff>=0.5",
+    "black>=24.8",
+    "mypy>=1.10",
+]
+
+# [project.scripts] — none yet; entrypoints for the package itself live in
+# slime_adapter/pyproject.toml.
+
+# ============================================================================
+# uv workspace
+# ============================================================================
+[tool.uv.workspace]
+members = ["slime_adapter"]
+
+# Pin ourselves at the root (the actual installable package is slime_adapter)
+[tool.uv.sources]
+slime_adapter = { workspace = true }
+torch = [
+    { index = "pytorch-cu128" },
+]
+torchvision = [
+    { index = "pytorch-cu128" },
+]
+
+# Pin torch wheels to match the NVIDIA driver on the host (CUDA 12.8).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# Externals that are git-only (uncomment and pin a commit when you bring them
+# under uv management; for now scripts/install_externals.sh handles them):
+#
+# slime = { git = "https://github.com/THUDM/slime", rev = "main" }
+# megatron-lm = { git = "https://github.com/NVIDIA/Megatron-LM", rev = "<commit>" }
+# sglang = { git = "https://github.com/sgl-project/sglang", rev = "<commit>", subdirectory = "python" }
+
+[tool.uv]
+# uv-specific knobs
+# ``managed = true`` means uv owns the env in .venv at workspace root.
+managed = true
+# Pin to a specific Python interpreter; fallback to system if unavailable.
+python-preference = "managed"
+
+# ============================================================================
+# Tooling
+# ============================================================================
+
+[tool.ruff]
+line-length = 119
+target-version = "py310"
+src = ["slime_adapter", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 119
+target-version = ["py310", "py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["slime_adapter/tests"]
+addopts = "-v --tb=short"
