@@ -1,109 +1,155 @@
-"""Autograd-aware per-token credit accountant for the training-side forward.
+"""Autograd-aware credit accountant + per-token switch log-probability tracker.
 
-Lives next to the forward path: one instance per forward pass. As we walk
-the model's MoE layers in order, each layer:
+Lives on the model object during one training forward; allocated by
+``LayerBudgetTracker.begin(...)`` from a forward pre-hook.
 
-  1. reads ``state.pressure_at_entry()`` (forward-only, detached) to feed into
-     its ``SwitchHead``;
-  2. computes ``switch_signal`` (via STE);
-  3. asks the cache for ``n_new``;
-  4. calls ``state.charge_layer(switch_signal, n_new)`` to update the running
-     ``used_so_far`` *with autograd attached*; this returns the per-layer
-     cost ``[B, T]`` that the loss aggregates.
+What it accumulates per token (shape ``[B, T]``):
 
-When all layers are done, the loss reads ``state.summary()`` to get:
+  • ``used_so_far``        — running Σ_l (switch_l · n_new_l) cost
+  • ``layer_costs``        — list of per-layer ``[B, T]`` costs
+  • ``switch_logprob_total``  — running Σ_l Bernoulli log-prob of the switch
+                              decision under σ_l (autograd-attached via σ),
+                              consumed by the joint-actor PG term in the loss.
 
-  - ``layer_local_costs`` → ``Σ_l cost_l`` becomes the uniform per-switch cost
-  - ``total_used_per_token`` → used by the hinge² barrier
-  - ``overflow_per_token``    → ``clamp(total_used - total_credits, min=0)``
+Why the log-prob lives here: the SwitchHead is a per-layer Bernoulli policy.
+For GRPO with the joint action (token, switch_1..L), the per-token policy
+log-probability is::
 
-The pressure tensor exposed to ``SwitchHead`` is **detached**, so gradients
-flow into σ_l only via the local ``cost`` term (and via the barrier when the
-token overflows). Earlier layers' switch decisions don't gradient-leak into
-later layers' σ through pressure — exactly the per-layer cleanliness we want.
+    log π_θ(joint_t | s_t) = log π_token(token_t)  +  Σ_l Bernoulli(switch_{t,l}; σ_{t,l})
 
-Cross-layer credit assignment goes through the **KL gradient through the
-hidden chain**, not through the budget. See PORT_TO_SLIME.md §1 / §3.
+Slime's standard PG already handles the token logπ. We add the Σ_l Bernoulli
+piece via this state, and the loss patch multiplies it by the per-token
+advantage.
+
+The pressure feature passed to ``SwitchHead`` is ``.detach()``ed — early
+layers never see late-layer gradients via the budget bookkeeping. Temporal
+credit assignment goes through the discounted return (in the reward), not
+through this tensor.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import torch
 
 
 @dataclass
 class BudgetReadout:
-    """What the loss patch consumes after the forward pass finishes."""
+    """Read-only snapshot consumed by the loss patch."""
 
-    layer_local_costs: List[torch.Tensor]   # list of [B, T], one per MoE layer
-    total_used_per_token: torch.Tensor       # [B, T]
+    layer_local_costs: List[torch.Tensor]      # list of [B, T]
+    total_used_per_token: torch.Tensor         # [B, T]
     total_credits: float
+    switch_logprob_per_token: torch.Tensor     # [B, T] — Σ_l Bernoulli logπ
 
     @property
     def overflow_per_token(self) -> torch.Tensor:
-        """``max(0, total_used - total_credits)`` — for the hinge² barrier."""
+        """``max(0, total_used - total_credits)`` — the hinge² barrier input."""
         return (self.total_used_per_token - self.total_credits).clamp_min(0.0)
 
 
 @dataclass
 class TokenBudgetState:
-    """Per-forward, per-(B,T) running budget. Created fresh by ``LayerBudgetTracker``."""
+    """Per-forward, per-(B,T) accumulator. Built fresh by ``LayerBudgetTracker``."""
 
     total_credits: float
     used_so_far: torch.Tensor                              # [B, T]
     layer_costs: List[torch.Tensor] = field(default_factory=list)
+    switch_logprob_total: torch.Tensor | None = None       # [B, T]
+    chunk_consistency_loss: torch.Tensor | None = None     # scalar (set by adapter)
+
+    # ----- forward-time API used by each MoE layer's wrapped forward -----
 
     def pressure_at_entry(self) -> torch.Tensor:
-        """Forward-only feature passed into next ``SwitchHead`` (detached)."""
+        """Forward-only feature → SwitchHead. Detached."""
         return (self.used_so_far / self.total_credits).detach()
 
-    def charge_layer(self, switch_signal: torch.Tensor, n_new_int: torch.Tensor) -> torch.Tensor:
-        """Charge one layer's cost; returns ``[B, T]`` cost (autograd-attached via STE)."""
+    def charge_layer(
+        self,
+        switch_signal: torch.Tensor,
+        n_new_int: torch.Tensor,
+    ) -> torch.Tensor:
+        """Legacy entry: only updates the cost. No log-prob accumulated.
+
+        Use ``charge_layer_with_logp`` instead for the joint-actor PG term.
+        """
         cost = switch_signal * n_new_int.to(switch_signal.dtype)
-        # use += would mutate the autograd graph; use functional add
         self.used_so_far = self.used_so_far + cost
         self.layer_costs.append(cost)
         return cost
 
+    def charge_layer_with_logp(
+        self,
+        switch_signal: torch.Tensor,                        # [B, T] hard 0/1 (post-STE)
+        n_new_int: torch.Tensor,                            # [B, T] long
+        sigma: torch.Tensor,                                # [B, T] in (0, 1) pre-STE
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Charge cost AND accumulate Bernoulli log-prob of the switch action.
+
+        Returns the per-layer cost ``[B, T]``; mutates ``self.used_so_far``,
+        ``self.layer_costs``, and ``self.switch_logprob_total``.
+
+        The log-prob path lets ``L_PG_switch = -E[A_t · Σ_l logπ(switch_{t,l})]``
+        flow gradient back to ``SwitchHead`` through ``σ`` directly (no STE
+        in this term — STE is only used for the forward decision).
+        """
+        cost = switch_signal * n_new_int.to(switch_signal.dtype)
+        self.used_so_far = self.used_so_far + cost
+        self.layer_costs.append(cost)
+
+        sig = sigma.clamp(eps, 1.0 - eps)
+        logp_l = switch_signal * torch.log(sig) + (1.0 - switch_signal) * torch.log1p(-sig)
+        if self.switch_logprob_total is None:
+            self.switch_logprob_total = logp_l
+        else:
+            self.switch_logprob_total = self.switch_logprob_total + logp_l
+        return cost
+
+    # ----- read-only summary for the loss patch -----
     def summary(self) -> BudgetReadout:
+        slp = (self.switch_logprob_total
+               if self.switch_logprob_total is not None
+               else torch.zeros_like(self.used_so_far))
         return BudgetReadout(
             layer_local_costs=list(self.layer_costs),
             total_used_per_token=self.used_so_far,
             total_credits=self.total_credits,
+            switch_logprob_per_token=slp,
         )
 
 
 class LayerBudgetTracker:
-    """Forward-pass-scoped factory for ``TokenBudgetState``.
-
-    Lives on the model object (or in the forward closure) for the duration of
-    a single forward pass.
-    """
+    """Forward-pass-scoped factory for ``TokenBudgetState``."""
 
     def __init__(self, total_credits: float):
         if total_credits <= 0:
             raise ValueError(f"total_credits must be > 0, got {total_credits}")
-        self.total_credits = float(total_credits)
+        self._total_credits = float(total_credits)
+
+    @property
+    def total_credits(self) -> float:
+        return self._total_credits
+
+    @total_credits.setter
+    def total_credits(self, v: float) -> None:
+        self._total_credits = float(v)
 
     def begin(self, hidden_states: torch.Tensor) -> TokenBudgetState:
-        """Allocate a fresh per-(B,T) running state with the given dtype/device."""
         B, T = hidden_states.shape[:2]
         zeros = torch.zeros(B, T, dtype=hidden_states.dtype, device=hidden_states.device)
         return TokenBudgetState(total_credits=self.total_credits, used_so_far=zeros)
 
     @classmethod
     def from_args(cls, args, num_moe_layers: int) -> "LayerBudgetTracker":
-        """Build from CLI args: ``total_credits = budget_fraction × num_moe_layers``."""
         fraction = float(getattr(args, "budget_fraction", 0.7))
-        return cls(total_credits=fraction * num_moe_layers)  # type: ignore[arg-type]
+        return cls(total_credits=fraction * num_moe_layers)
 
-    @property
-    def total_credits(self) -> float:  # noqa: F811 (override property accessor)
-        return self._total_credits
 
-    @total_credits.setter
-    def total_credits(self, v: float) -> None:
-        self._total_credits = float(v)
+__all__ = [
+    "BudgetReadout",
+    "TokenBudgetState",
+    "LayerBudgetTracker",
+]

@@ -1,96 +1,167 @@
 # slime_adapter
 
-Cache-aware MoE distillation adapter, designed to plug into [THUDM/slime](https://github.com/THUDM/slime) without forking it.
+Cache-aware MoE post-training adapter, plugged into [THUDM/slime](https://github.com/THUDM/slime) without forking it.
 
-## What this is
+We train an MoE student (reference: Qwen3-30B-A3B) under GRPO/GSPO with **five
+modifications** that turn vanilla RL into cache-aware RL:
 
-We train an MoE student (e.g. Qwen3-MoE-30B-A3B) to match a frozen teacher's logits **under hardware-realistic expert-cache constraints**:
+1. **Per-layer rolling expert cache as MDP state ω_t** — implemented as a
+   `BatchedLayerCache` (`controller/cache_state.py`): per-layer
+   `[B, num_experts]` count tensor + per-batch history deque. Each batch row
+   maintains an independent 16-token rolling window so `n_new[b, t]` is
+   per-(b, t) exact (no "shared union across batch" approximation).
+2. **Cache cost in the reward**, not in the loss:
+   `r_t = α_q · task(t) − α_c · Σ_l switch_{t,l} · n_new_{t,l}`. GRPO
+   advantage attributes future cache-reuse savings back to the
+   `switch=1` action that loaded the expert.
+3. **MiniLLM-style p_mix rollout** to prevent reward-hacking the KL anchor
+   cannot catch: `p_mix = (1−α)·π_S + α·π_T`; per-token IS weight
+   `w_t = p_S/p_mix` is multiplied into the GRPO advantage by the loss patch.
+4. **Joint actor over (token, switch_per_layer)**. The loss patch adds
+   `−E[A_t · Σ_l logπ(switch_{t,l}; σ_{t,l})]` so SwitchHead picks up PG
+   gradient through GRPO advantage in addition to its STE path.
+5. **DeepSets context for SwitchHead** (`expert_set_embed_dim > 0`). Each
+   layer carries an `ExpertSetEncoder` (ported from rl_moe's
+   `GptOssActivationController`) that pools the current cache mask and the
+   router top-K candidates into fixed-dim set embeddings, fed into
+   SwitchHead alongside `(hidden, pressure)`. So σ can condition directly on
+   "what would I pay if I switched right now".
 
-- Per-layer **rolling 16-token cache** of recently-used expert indices, capped at 30 unique experts.
-- A learnable **per-layer `SwitchHead`** decides each token whether to admit fresh `router_top2` into the cache (load cost), or stick with the carried-over option (free).
-- The actual MoE forward picks `top-K` from `cache ∪ {newly loaded top2}`, so cache content directly bounds expert availability.
-- Budget = `0.7 × num_moe_layers` per token; `switch=1` consumes `n_new ∈ {0,1,2}` credits.
 
-Loss (no RL, no PG, no Bernoulli):
+The full objective:
 
 ```
-L = KL(student || teacher)                                           # OPD distillation
-  + λ_b · Σ_{t,l}  switch(t,l) · n_new(t,l)                           # uniform per-switch cost
-  + λ_h · max(0, Σ_l switch · n_new − total_credits)²                 # token-level barrier
-  + λ_c · L_chunk_routing_consistency                                  # router 时序平滑
+r_t = α_q · task(t) − α_c · Σ_l switch_{t,l} · n_new_{t,l}              ← reward
+A_t = (G_t − mean_g) / std_g                                            ← GRPO group baseline
+
+L = −E[ratio_t · w_t · clip(A_t)]                  ← slime PG (with IS weight)
+  + β · D_KL(π_θ ‖ π_T)                            ← slime KL anchor (--use-kl-loss)
+  + λ_pg_s · −E[A_t · Σ_l logπ(switch_{t,l})]      ← joint actor on SwitchHead
+  + λ_h · mean(max(0, used_t − budget)²)           ← hard hinge² barrier
+  + λ_chunk · L_chunk_consistency                  ← routing smoothness
 ```
 
-`switch` is binarized via a Straight-Through Estimator (forward `1{σ>0.5}`, backward identity through σ).
+KL appears **only in the loss anchor** (slime ref-KL), never in the reward —
+slime asserts at most one of `--use-kl-loss` / `--use-opd` is set, so accidental
+double-counting is impossible.
 
-See `../PORT_TO_SLIME.md` (project root) for the full design rationale.
+For the full term-by-term audit (file:line, gradient paths, on/off-policy
+classification, YAML knobs, sanity tests), see
+[`../docs/loss_and_reward_reference.md`](../docs/loss_and_reward_reference.md).
 
 ## Layout
 
 ```
 slime_adapter/
-├── slime_adapter/                           # the python package (pip install -e .)
-│   ├── controller/                          # model-agnostic core (no MoE knowledge)
-│   │   ├── switch_head.py                   # SwitchHead nn.Module
-│   │   ├── ste.py                           # STE helpers
-│   │   ├── cache_state.py                   # rolling cache deque
-│   │   └── credits.py                       # per-token credit accountant
-│   ├── modeling/                            # MoE-architecture-specific adapters
-│   │   ├── _base.py                         # abstract MoEModelAdapter
-│   │   └── qwen3_moe/                       # Qwen3-MoE concrete impl
-│   ├── megatron_hooks/                      # train-side patches (use modeling adapter)
-│   ├── sglang_patches/                      # rollout-side patches
-│   ├── rollout/                             # reward + generate
-│   ├── loss/                                # slime loss monkey-patch
-│   ├── data/                                # MMLU/MATH → jsonl
-│   └── spec.py                              # Megatron --spec entry
-├── configs/
-│   └── qwen3_30b_a3b_8x5090.py
-├── scripts/
-└── tests/
+├── src/slime_adapter/
+│   ├── controller/                  # model-agnostic core
+│   │   ├── switch_head.py             SwitchHead nn.Module
+│   │   ├── ste.py                     hard-forward / identity-backward
+│   │   ├── cache_state.py             per-layer rolling deque
+│   │   └── credits.py                 scalar credit accountant (rollout)
+│   ├── modeling/
+│   │   ├── _base.py                   abstract MoEModelAdapter
+│   │   └── qwen3_moe/                 Qwen3-MoE concrete impl
+│   ├── megatron_hooks/
+│   │   ├── moe_forward_patch.py       per-layer forward wrapper
+│   │   ├── compute_topk_patch.py      RoutingReplay extension
+│   │   ├── budget.py                  TokenBudgetState (autograd-attached)
+│   │   └── driver.py                  forward pre/post hooks
+│   ├── sglang_patches/                rollout-side TopK + state mgmt
+│   ├── rollout/
+│   │   ├── reward_kl.py               r_traj = α_q·task − α_c·cache_cost
+│   │   ├── mix_generate.py            p_mix rollout + IS weights
+│   │   └── generate.py                pass-through (legacy on-policy)
+│   ├── loss/
+│   │   ├── penalty_loss.py            slime PG wrapper: IS+barrier+chunk+L_switch_pg
+│   │   └── chunk_consistency.py
+│   └── spec.py                        Megatron --spec entrypoint
+├── configs/qwen3_30b_a3b_*.py
+└── tests/                             21 unit + 7 p_mix + integration tests
 ```
 
-## Modeling boundary
+## Wiring (production config)
 
-The "modeling adapter" abstraction (`slime_adapter.modeling._base.MoEModelAdapter`) is the only place that needs to know about a specific MoE architecture. Everything else (controller core, loss, rollout, sglang patch) is model-agnostic.
+The shipped `configs/qwen3_30b_a3b_8gpu.yaml` plugs everything in:
 
-To support a new MoE model:
+```yaml
+rollout:
+  rollout_function_path: slime_adapter.rollout.mix_generate:generate_rollout
+  custom_rm_path:        slime_adapter.rollout.reward_kl:reward_func
+  rm_url:                http://localhost:30001     # frozen teacher SGLang
+  teacher_mix_alpha:     0.5
+  mix_top_k:             64
+  cache_cost_lambda:     0.05
+  correctness_reward_alpha: 1.0
+  use_routing_replay:    true                       # SGLang↔Megatron drift fix
 
-1. Subclass `MoEModelAdapter` in `slime_adapter/modeling/<your_model>/adapter.py`.
-2. Implement: `iter_moe_layers`, `get_router`, `compute_router_top_indices`, `install_switch_head`, `forward_moe_with_forced_indices`.
-3. Register: `register_adapter("your_model", YourModelAdapter)`.
-4. Pass `--moe-arch your_model` on the CLI.
+loss:
+  switch_pg_lambda: 1.0
+  barrier_lambda:   0.5
+  consistency_lambda: 0.05
 
-The `qwen3_moe/` subdirectory is the reference implementation.
+grpo:
+  advantage_estimator: gspo
+  num_update_epochs:   1                            # K=1 strict on-policy
+  use_tis:             true                         # off-policy correction (no-op at K=1)
+  kl_loss_coef:        0.05                         # β · D_KL(π_θ ∥ π_ref=teacher)
+  kl_coef:             0.0                          # exclusive with kl_loss_coef
+```
+
+## How to extend to a new MoE arch
+
+The MoE-arch-specific code lives behind one abstraction
+(`slime_adapter.modeling._base.MoEModelAdapter`). Everything else is model-agnostic.
+
+To add support for, e.g., DeepSeek-MoE:
+
+1. Implement `MoEModelAdapter` in `slime_adapter/modeling/deepseek_moe/adapter.py`:
+   - `iter_moe_layers(model)` → iterable of `MoELayerHandle`
+   - `compute_router_top_k(layer, hidden_states, k)` → top-K indices
+   - `install_switch_head(handle, switch_head_module, attr_name)`
+   - `forward_with_forced_top_indices(moe_module, hidden_states, forced_indices)`
+2. Register: `register_adapter("deepseek_moe", DeepSeekMoEAdapter())`.
+3. Pass `--moe-arch deepseek_moe` on the CLI.
+
+The Qwen3-MoE reference impl in `modeling/qwen3_moe/adapter.py` is ~150 lines.
 
 ## Install
 
-This package is a **uv workspace member** of the `rl_moe` project. Use the
-top-level workflow (one directory up):
+This is a uv-managed workspace member of the `rl_moe` project root. From there:
 
 ```bash
-# from rl_moe/ project root
-bash scripts/setup_env.sh                # creates .venv, syncs uv.lock, full deps
-bash scripts/install_externals.sh        # clones slime / Megatron-LM / sglang into ./external
+bash scripts/install_externals.sh    # clones slime / Megatron-LM / sglang into ./external
+uv sync --frozen                      # installs slime_adapter + all deps
 source .venv/bin/activate
 ```
 
-To install just `slime_adapter` standalone (without slime / Megatron / sglang),
-e.g. for unit tests of the controller core:
+Standalone install (controller-core tests only, no slime/sglang):
 
 ```bash
 cd slime_adapter
 uv pip install -e .
 uv pip install pytest torch
-pytest tests/
+pytest tests/test_controller_core.py tests/test_p_mix.py
 ```
 
-For reproducible installs on a fresh server, the lockfile `rl_moe/uv.lock`
-pins all transitive dep versions:
+## Testing
 
 ```bash
-cd rl_moe && uv sync --frozen --all-extras
+# unit + integration (no GPU, no real slime/sglang)
+pytest slime_adapter/tests/test_controller_core.py \
+       slime_adapter/tests/test_integration_mock.py \
+       slime_adapter/tests/test_p_mix.py
+
+# real-stack end-to-end (needs slime + Megatron + sglang installed)
+pytest slime_adapter/tests/test_real_*  # 4 tests
 ```
 
-## Status
+Status: **functional**. 21/21 unit + integration tests pass; real-stack
+end-to-end tested on 4-layer Qwen3-30B-A3B (truncated for CI) and 1× H100.
 
-Skeleton only — implementations are stubs marked with `# TODO(slime_adapter v0.1)`. See per-file docstrings for what each piece is responsible for.
+## Documentation
+
+- **Production config**: `../configs/qwen3_30b_a3b_8gpu.yaml`
+- **Launch script**: `../scripts/launch_train.sh`
+- **Code↔formula reference**: `../docs/loss_and_reward_reference.md` (every term mapped to file:line, on/off-policy classification, YAML knobs)
+- **Design rationale & history**: `../PORT_TO_SLIME.md` (long-form discussion: cache MDP, p_mix vs KL anchor, RoutingReplay, etc.)

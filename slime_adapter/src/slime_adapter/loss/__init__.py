@@ -15,6 +15,9 @@ to apply. Typical usage::
 """
 
 from . import penalty_loss as _penalty_loss  # noqa: F401  (patch on import)
-from .chunk_consistency import chunk_routing_consistency_loss
+from .chunk_consistency import (
+    chunk_routing_consistency_loss,
+    compute_chunk_consistency,
+)
 
-__all__ = ["chunk_routing_consistency_loss"]
+__all__ = ["chunk_routing_consistency_loss", "compute_chunk_consistency"]

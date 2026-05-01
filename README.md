@@ -1,127 +1,123 @@
-# Temporally Extended Mixture-of-Experts Models
+# Cache-aware MoE post-training (slime_adapter) + Original Option-Critic (rl_moe)
 
-This repository implements **temporally extended MoE** controller training using the **Option-Critic** framework with deliberation costs. A lightweight per-layer controller learns when to switch expert sets and which to load, reducing switch rates from >50% to under 5% while retaining up to ~90% of base-model accuracy.
+This repository hosts **two** generations of cache-aware MoE training code:
 
-**Paper:** [Temporally Extended Mixture-of-Experts Models](https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf)
+1. **`slime_adapter/`** — current generation. Cache-aware GRPO post-training of
+   Qwen3-30B-A3B (or any HF MoE) on top of THUDM/slime + Megatron-LM + SGLang.
+   This is what `scripts/quickstart.sh` launches.
+2. **`train_controller_standalone.py` + `transformers_patches/`** — original
+   single-host Option-Critic training of GPT-OSS-20B with mxfp4 dequantize +
+   LoRA. Kept for reference; superseded by slime_adapter.
 
-**Project Page:** [https://princeton-polaris-lab.github.io/moe_webpage/](https://princeton-polaris-lab.github.io/moe_webpage/)
+The rest of this README focuses on the slime_adapter path. The original
+codebase docs are at the bottom under "Legacy: Option-Critic on GPT-OSS".
 
-## Features
+---
 
-- **Activation-based Controller**: Uses LLM hidden states directly with DeepSets for expert selection
-- **Option-Critic with Deliberation Costs**: Learns when to switch expert sets via termination, value, and Plackett-Luce selection heads
-- **Self-Distillation Reward**: Per-token reverse KL between frozen teacher and controller-augmented student
-
-## Installation
-
-### 1. Create Python Environment
-
-```bash
-conda create -n rl_moe python=3.11
-conda activate rl_moe
-```
-
-### 2. Install Dependencies
+## Quickstart (one command)
 
 ```bash
-pip install -r requirements.txt
+git clone <this repo> rl_moe
+cd rl_moe
+bash scripts/quickstart.sh
 ```
 
-### 3. Apply Transformers Patches
+That single script runs:
 
-This project requires custom modifications to the `transformers` library for MoE controller support.
+1. install `uv`, run `uv sync --frozen` (creates `./.venv`)
+2. clone+install `slime`, `Megatron-LM`, `sglang` into `./external/`
+3. start a frozen teacher SGLang server on `localhost:30001`
+4. run training via `scripts/launch_train.sh configs/qwen3_30b_a3b_8gpu.yaml`
+
+If you've already done the env / externals once, re-runs are short-circuited:
 
 ```bash
-chmod +x install.sh
-./install.sh
+SKIP_TEACHER=1 bash scripts/quickstart.sh           # train against an existing teacher
+SKIP_SETUP=1 SKIP_EXTERNALS=1 bash scripts/quickstart.sh
 ```
 
-Or specify a custom environment path:
+Logs land under `runs/<run_name>/` (Tensorboard) and `external/slime/...`. To
+view metrics:
 
 ```bash
-./install.sh /path/to/your/python/env
+tensorboard --logdir runs/
 ```
 
-## Usage
+## What this trains
 
-### Training a Controller
+A 5-modification cache-aware MoE actor — see `docs/loss_and_reward_reference.md`
+for a per-term audit, or `slime_adapter/README.md` for a module summary:
 
-Use the launch script for grid search:
+1. **Per-layer rolling expert cache as MDP state ω_t**
+   (`controller/cache_state.py:BatchedLayerCache`)
+2. **Cache cost in the reward**, not the loss
+   (`rollout/reward_kl.py:post_process_rewards`)
+3. **MiniLLM-style p_mix rollout** with the `log p_mix` written to
+   `rollout_log_probs` so slime's native TIS handles the IS correction
+   (`rollout/mix_generate.py`)
+4. **Joint actor over (token, switch_per_layer)**: extra
+   `−E[A_t · Σ_l logπ(switch_{t,l})]` term in the loss
+   (`loss/penalty_loss.py`)
+5. **DeepSets context for SwitchHead**: cache mask + router top-K encoded
+   into fixed-dim set reps and fed into σ
+   (`controller/expert_set_encoder.py` + `controller/switch_head.py`)
+
+KL-to-teacher uses slime's native OPD-sglang path (`use_opd: true,
+opd_type: sglang`) — teacher logprobs come from the teacher SGLang server
+that is launched by `quickstart.sh` and consumed via `Sample.teacher_log_probs`.
+
+## File map
+
+```
+configs/qwen3_30b_a3b_8gpu.yaml   # production config (8-GPU EP=8)
+scripts/
+  quickstart.sh                   # one-command bootstrap (this README) ← start here
+  setup_env.sh                    # uv + venv only
+  install_externals.sh            # slime / Megatron-LM / sglang clone
+  launch_train.sh                 # trainer launcher (called by quickstart)
+  run_train.py                    # YAML → slime CLI args + run
+slime_adapter/                    # the new framework (uv workspace member)
+  src/slime_adapter/...           # modules: controller / loss / rollout / megatron_hooks / sglang_patches
+  tests/                          # 35 unit + 5 GPU-only e2e tests
+docs/
+  loss_and_reward_reference.md    # canonical per-term reference (file:line)
+PORT_TO_SLIME.md                  # design rationale + v4 changelog
+```
+
+## Tests
 
 ```bash
-# Edit launch_grid_activation.sh to configure hyperparameters
-bash launch_grid_activation.sh
+# unit + integration (no GPU, no slime needed)
+uv run --frozen --no-sync python -m pytest slime_adapter/tests/ -q
+# 35 passed, 5 skipped
+
+# end-to-end against the real stack (needs GPU + ./external/* installed)
+uv run --frozen --no-sync python -m pytest slime_adapter/tests/test_real_*.py -q
 ```
 
-Or run directly via accelerate:
+## Reading order
 
-```bash
-accelerate launch \
-    --config_file accelerate_config.yaml \
-    --mixed_precision=no \
-    train_controller_standalone.py \
-    --controller_type activation \
-    --controller_allowed_experts 16 \
-    --deliberation_cost 0.02 \
-    --reward_type kl \
-    --response-length 512 \
-    --logging-steps 1 \
-    --save-steps 20
-```
+1. `slime_adapter/README.md` — module-level overview
+2. `docs/loss_and_reward_reference.md` — every loss/reward term mapped to file:line
+3. `PORT_TO_SLIME.md` — full design discussion / v1→v4 history / risks
 
-### Key Hyperparameters
+---
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--controller_type` | Controller type (`activation`) | activation |
-| `--controller_allowed_experts` | Number of experts in the mask ($k_{\text{mask}}$) | 16 |
-| `--deliberation_cost` | Cost for switching experts ($\eta$) | 0.02 |
-| `--reward_type` | Reward function (`kl`) | kl |
-| `--with_lora` | Enable LoRA adapters on experts and attention | flag |
+# Legacy: Option-Critic on GPT-OSS
 
-### Evaluation
+The original rl_moe scaffold (single-host LoRA-on-frozen-base + Option-Critic with
+explicit V/Q/term heads) lives in:
 
-Evaluation scripts are in the `eval/` directory:
+- `train_controller_standalone.py`
+- `activation_controller_trainer.py`
+- `transformers_patches/`
+- `launch_grid_activation.sh`
 
-```bash
-# Evaluate controller on MATH
-python eval/eval_math.py --checkpoint-dir /path/to/checkpoint --step 120 --controller-type activation
-
-# Evaluate controller on MMLU/MMMLU
-python eval/eval_mmlu_controller.py --checkpoint-dir /path/to/checkpoint --step 120 --controller-type activation
-
-# Evaluate pruning baselines on MMLU/MMMLU
-python eval/eval_mmlu_baseline.py --method frequency --num-experts 16
-```
-
-## Project Structure
-
-```
-rl_moe/
-├── train_controller_standalone.py    # Main training entrypoint
-├── activation_controller_trainer.py  # Activation-based controller trainer
-├── launch_grid_activation.sh         # SLURM grid search launcher
-├── run_controller.slurm              # Single-job SLURM script
-├── accelerate_config.yaml            # Accelerate distributed config
-├── deepspeed_config.json             # DeepSpeed config (referenced by accelerate)
-├── transformers_patches/             # Custom transformers modifications
-│   ├── models/gpt_oss/
-│   │   ├── modeling_gpt_oss.py       # MoE model with controller hooks
-│   │   ├── configuration_gpt_oss.py
-│   │   └── __init__.py
-│   ├── integrations/
-│   │   └── mxfp4.py
-│   ├── modeling_outputs.py
-│   └── generation/
-│       └── utils.py
-├── eval/
-│   ├── eval_math.py                  # MATH benchmark evaluation
-│   ├── eval_mmlu_controller.py       # MMLU/MMMLU evaluation with controller
-│   └── eval_mmlu_baseline.py         # MMLU/MMMLU evaluation for baselines
-├── requirements.txt
-├── install.sh                        # Patch installation script
-└── README.md
-```
+It targets gpt-oss-20b (mxfp4 storage → dequantize-on-load → bf16 + LoRA), uses
+Plackett-Luce selection + Q-based ascent, and is mostly subsumed by the
+slime_adapter pipeline above. Kept around for reproducing the
+[paper](https://arxiv.org/abs/...) results and as a reference implementation
+for the Option-Critic head architecture (`GptOssActivationController`).
 
 ## Citation
 
@@ -129,6 +125,6 @@ rl_moe/
 @article{shen2026temoe,
   title  = {Temporally Extended Mixture-of-Experts Models},
   author = {Shen, Zeyu and Henderson, Peter},
-  year   = {2026}
+  year   = {2026},
 }
 ```

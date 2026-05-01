@@ -120,3 +120,145 @@ class LayerCache:
         return evicted
 
 
+# =====================================================================
+# BatchedLayerCache — torch tensor implementation for the train forward
+# =====================================================================
+
+class BatchedLayerCache:
+    """Per-layer rolling expert cache, batched across (B, T) on-device.
+
+    Lazy lifecycle:
+
+        cache = BatchedLayerCache(num_experts=128, window=16, cap=30)
+        # before each train forward:
+        cache.begin_batch(batch_size=B, device=hidden.device)
+        # at each token position t (sequential over T inside the layer wrap):
+        n_new_t = cache.n_new(used_top2_t)        # [B] long
+        cache.push(used_top2_t)                   # advance the window
+
+    State:
+      count   : [B, num_experts] int64    occurrences in window
+      history : list of [B, k]   int64    last <= window pushes (newest at end)
+
+    Both window-eviction and cap-eviction are enforced exactly as in
+    ``LayerCache`` (the rollout-side Python implementation), so train-time and
+    rollout-time agree on what counts as ``n_new``.
+
+    n_new is integer; nothing in this object is differentiable. Switching to
+    BatchedLayerCache replaces the previous "shared-union-across-batch"
+    approximation in ``moe_forward_patch._compute_n_new_batched`` with a
+    proper per-(b, t) account.
+    """
+
+    DEFAULT_WINDOW = 16
+    DEFAULT_CAP = 30
+
+    def __init__(
+        self,
+        num_experts: int,
+        window: int = DEFAULT_WINDOW,
+        cap: int = DEFAULT_CAP,
+    ) -> None:
+        if num_experts < 1:
+            raise ValueError(f"num_experts must be >= 1, got {num_experts}")
+        if window < 1:
+            raise ValueError(f"window must be >= 1, got {window}")
+        if cap < 1:
+            raise ValueError(f"cap must be >= 1, got {cap}")
+        self.E = int(num_experts)
+        self.window = int(window)
+        self.cap = int(cap)
+        self._count: "torch.Tensor | None" = None
+        self._history: List["torch.Tensor"] = []
+        self._batch_size: int = 0
+
+    # ----- lifecycle -----
+
+    def begin_batch(self, batch_size: int, *, device=None, dtype=None) -> None:
+        """Allocate fresh state for a new forward. Must be called once per
+        forward pass before any push/n_new."""
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = int(batch_size)
+        self._count = torch.zeros(
+            self._batch_size, self.E,
+            dtype=torch.int64, device=device,
+        )
+        self._history = []
+
+    # ----- core ops -----
+
+    def n_new(self, top_k: "torch.Tensor") -> "torch.Tensor":
+        """``top_k: [B, k]`` (long) → ``[B]`` long count of missing experts."""
+        if self._count is None:
+            raise RuntimeError("call begin_batch(batch_size, ...) first")
+        gathered = self._count.gather(1, top_k.long())            # [B, k]
+        in_cache = gathered > 0
+        return (~in_cache).sum(dim=-1).to(torch.int64)             # [B]
+
+    def push(self, used_top_k: "torch.Tensor") -> None:
+        """Advance the rolling window with one push per batch position.
+
+        Window-only eviction (cap dropped in v4): the union size is bounded
+        implicitly by ``window × k`` (≈ 32 for window=16, k=2). No CPU sync
+        required.
+        """
+        if self._count is None:
+            raise RuntimeError("call begin_batch(batch_size, ...) first")
+        used = used_top_k.detach().long()                          # [B, k]
+        # add new entry
+        ones = torch.ones_like(used)
+        self._count.scatter_add_(1, used, ones)
+        self._history.append(used)
+        # window-eviction (no cap pass — pure rolling window of last `window` entries)
+        while len(self._history) > self.window:
+            old = self._history.pop(0)
+            self._count.scatter_add_(1, old, -torch.ones_like(old))
+
+    def n_new_and_push(self, used_top_k: "torch.Tensor") -> "torch.Tensor":
+        """Combined: returns ``[B]`` n_new before the push."""
+        n = self.n_new(used_top_k)
+        self.push(used_top_k)
+        return n
+
+    # ----- read-only -----
+
+    @property
+    def count(self) -> "torch.Tensor":
+        """``[B, num_experts]`` int64; >0 means expert is currently in cache."""
+        if self._count is None:
+            raise RuntimeError("call begin_batch first")
+        return self._count
+
+    def union_mask(self) -> "torch.Tensor":
+        """``[B, num_experts]`` bool union view."""
+        if self._count is None:
+            raise RuntimeError("call begin_batch first")
+        return self._count > 0
+
+    def size_per_batch(self) -> "torch.Tensor":
+        """``[B]`` int64: distinct expert count per batch position."""
+        return self.union_mask().sum(dim=-1).long()
+
+    def __repr__(self) -> str:
+        if self._count is None:
+            return f"BatchedLayerCache(uninitialized, window={self.window}, cap={self.cap})"
+        return (
+            f"BatchedLayerCache(B={self._batch_size}, E={self.E}, "
+            f"window={self.window}, cap={self.cap}, "
+            f"history_len={len(self._history)}, "
+            f"distinct_max={int((self._count > 0).sum(dim=-1).max())})"
+        )
+
+
+# =====================================================================
+# Module-level torch import (lazy — keeps the pure-Python LayerCache
+# importable in environments without torch).
+# =====================================================================
+
+try:
+    import torch  # noqa: E402
+except ImportError:  # pragma: no cover - torch is a hard dep at runtime
+    torch = None  # type: ignore
+
+

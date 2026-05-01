@@ -74,13 +74,19 @@ class Qwen3MoEAdapter(MoEModelAdapter):
     def compute_router_top_k(self, moe_module, hidden_states, k: int = 2):
         """Return ``[..., k]`` LongTensor: router's natural argmax-k.
 
-        We bypass mcore's full router forward (which also runs softmax +
-        dispatch) and read out the linear scores directly. softmax is
-        monotonic so argmax-k of logits == argmax-k of softmax probs.
+        We bypass the full mcore router forward (softmax + dispatch state) and
+        read out the raw linear scores directly. softmax is monotonic so
+        argmax-k(logits) == argmax-k(softmax(logits)).
+
+        Side effect: caches the full ``[..., E]`` router logits on
+        ``moe_module._slime_router_logits`` so the wrapped forward can pass
+        them to ``compute_chunk_consistency`` later. Top-K selection itself
+        runs under ``no_grad``; the chunk-loss path detaches anyway.
         """
         weight, bias = self._get_router_params(moe_module.router)
+        logits = torch.nn.functional.linear(hidden_states, weight, bias)
+        moe_module._slime_router_logits = logits          # [B, T, E] for chunk_loss
         with torch.no_grad():
-            logits = torch.nn.functional.linear(hidden_states, weight, bias)
             return logits.topk(k=k, dim=-1).indices
 
     # ==================================================================

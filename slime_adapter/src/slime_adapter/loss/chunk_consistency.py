@@ -18,6 +18,50 @@ import torch
 import torch.nn.functional as F
 
 
+def compute_chunk_consistency(
+    *,
+    router_logits: torch.Tensor | None = None,
+    chunk_size: int = 8,
+    enabled: bool = False,
+    eps: float = 1e-12,
+    device=None,
+) -> torch.Tensor:
+    """Public hook the wrapped MoE-layer forward calls to obtain the chunk
+    routing-consistency loss term.
+
+    Stage-1 default: returns a 0-d tensor (placeholder). When ``enabled=True``
+    AND ``router_logits`` is provided, forwards to
+    :func:`chunk_routing_consistency_loss` below.
+
+    Rationale for the gate
+        Extracting ``router_logits`` is adapter-specific. We ship the wiring
+        with a no-op default so the loss pipeline never depends on per-adapter
+        plumbing. Flip ``enabled=True`` (and pass real logits) once an adapter
+        routes them through.
+
+    Args:
+        router_logits: ``[B, T, L, E]`` or ``[B, T, E]`` (single layer).
+        chunk_size: chunk width K (tokens per chunk).
+        enabled: when False, always returns zero (default).
+        device: optional device hint when ``router_logits`` is None.
+        eps: log-domain floor.
+
+    Returns:
+        Scalar ``torch.Tensor`` (0-d). Plug into
+        ``state.chunk_consistency_loss = compute_chunk_consistency(...)``.
+    """
+    if not enabled or router_logits is None:
+        target = device or (router_logits.device if router_logits is not None else None)
+        return (torch.zeros((), device=target)
+                if target is not None else torch.tensor(0.0))
+    if router_logits.dim() == 3:
+        router_logits = router_logits.unsqueeze(2)
+    return chunk_routing_consistency_loss(
+        router_logits, chunk_size=chunk_size, eps=eps,
+    )
+
+
+
 def chunk_routing_consistency_loss(
     router_logits: torch.Tensor,
     chunk_size: int = 8,

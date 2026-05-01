@@ -52,36 +52,71 @@ class SwitchHead(nn.Module):
         init_bias: float = -2.0,
         use_pressure_input: bool = True,
         zero_init_weight: bool = True,
+        *,
+        cache_set_dim: int = 0,
+        topk_set_dim: int = 0,
     ) -> None:
+        """SwitchHead with optional DeepSets context.
+
+        Args:
+            hidden_size: dim of pre-MoE hidden state.
+            init_bias: cold-start σ ≈ sigmoid(init_bias).
+            use_pressure_input: append 1-d pressure scalar.
+            zero_init_weight: zero the weight matrix so cold-start σ depends only on bias.
+            cache_set_dim: dim of the cache set representation (output of
+                ``ExpertSetEncoder``). 0 = disabled (legacy behavior).
+            topk_set_dim: dim of the top-K set representation. 0 = disabled.
+        """
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.use_pressure_input = bool(use_pressure_input)
-        in_dim = self.hidden_size + (1 if self.use_pressure_input else 0)
+        self.cache_set_dim = int(cache_set_dim)
+        self.topk_set_dim = int(topk_set_dim)
+        in_dim = (
+            self.hidden_size
+            + (1 if self.use_pressure_input else 0)
+            + self.cache_set_dim_safe()
+            + self.topk_set_dim_safe()
+        )
         self.linear = nn.Linear(in_dim, 1)
         if zero_init_weight:
             nn.init.zeros_(self.linear.weight)
         else:
-            nn.init.normal_(self.linear.weight, std=1.0 / math.sqrt(in_dim))
+            nn.init.normal_(self.linear.weight, std=1.0 / max(1, in_dim) ** 0.5)
         nn.init.constant_(self.linear.bias, float(init_bias))
+
+    def cache_set_dim_safe(self) -> int:
+        return max(0, int(self.cache_set_dim))
+
+    def topk_set_dim_safe(self) -> int:
+        return max(0, int(self.topk_set_dim))
 
     def forward(
         self,
         hidden: torch.Tensor,
         pressure_scalar: torch.Tensor | None = None,
+        cache_set_repr: torch.Tensor | None = None,
+        top_k_set_repr: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Returns logits with shape == hidden.shape[:-1]."""
+        """Returns logits with shape == hidden.shape[:-1].
+
+        Optional inputs (set ``cache_set_dim``/``topk_set_dim`` > 0 to enable):
+            cache_set_repr  — DeepSets pool of currently-cached experts; shape
+                              ``[..., cache_set_dim]``, broadcastable over leading dims.
+            top_k_set_repr  — DeepSets pool of router top-k indices; shape
+                              ``[..., topk_set_dim]``.
+        """
+        feats = [hidden]
+
         if self.use_pressure_input:
             if pressure_scalar is None:
                 raise ValueError(
                     "SwitchHead built with use_pressure_input=True; pass `pressure_scalar=...`."
                 )
-            # Broadcast pressure to (...,) matching hidden's leading dims, then to (...,1).
-            p = pressure_scalar.to(dtype=hidden.dtype)
+            p = pressure_scalar.to(hidden.dtype)
             if p.dim() == 0:
-                # scalar pressure → broadcast to (...,1)
                 p = p.expand(*hidden.shape[:-1])
             elif p.shape != hidden.shape[:-1]:
-                # caller may have passed [B] for [B, T, H] — broadcast over T
                 try:
                     p = p.expand(*hidden.shape[:-1])
                 except RuntimeError as e:
@@ -89,12 +124,49 @@ class SwitchHead(nn.Module):
                         f"pressure_scalar shape {tuple(p.shape)} cannot be broadcast to "
                         f"hidden's leading dims {tuple(hidden.shape[:-1])}"
                     ) from e
-            x = torch.cat([hidden, p.unsqueeze(-1)], dim=-1)
-        else:
-            x = hidden
+            feats.append(p.unsqueeze(-1))
+
+        if self.cache_set_dim > 0:
+            if cache_set_repr is None:
+                raise ValueError(
+                    f"SwitchHead built with cache_set_dim={self.cache_set_dim}; "
+                    "pass cache_set_repr=..."
+                )
+            feats.append(_broadcast_to_leading(cache_set_repr, hidden))
+
+        if self.topk_set_dim > 0:
+            if top_k_set_repr is None:
+                raise ValueError(
+                    f"SwitchHead built with topk_set_dim={self.topk_set_dim}; "
+                    "pass top_k_set_repr=..."
+                )
+            feats.append(_broadcast_to_leading(top_k_set_repr, hidden))
+
+        x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=-1)
         return self.linear(x).squeeze(-1)
 
-    # ----- conveniences -----
-    @property
-    def init_switch_prob(self) -> float:
-        return float(torch.sigmoid(self.linear.bias.detach()).mean().item())
+
+def _broadcast_to_leading(rep: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+    """Broadcast ``rep`` to match ``hidden``'s leading dims.
+
+    If ``rep.shape[-1] == D`` and ``rep.shape[:-1] != hidden.shape[:-1]``,
+    we add a singleton dim before the last and expand. Most common case:
+    ``hidden=[B, T, H]``, ``rep=[B, D]`` → returns ``[B, T, D]``.
+    """
+    if rep.shape[:-1] == hidden.shape[:-1]:
+        return rep.to(dtype=hidden.dtype)
+    cur = rep.to(dtype=hidden.dtype)
+    while cur.dim() < hidden.dim():
+        cur = cur.unsqueeze(-2)
+    target = list(hidden.shape[:-1]) + [cur.shape[-1]]
+    return cur.expand(*target)
+
+
+def _switch_head_init_switch_prob(self) -> float:
+    """Cold-start σ from the bias alone (zero-init weights → output ≈ bias)."""
+    return float(torch.sigmoid(self.linear.bias.detach()).mean().item())
+
+
+# Re-attach the convenience property to SwitchHead (defined out of body to keep
+# the function block above readable).
+SwitchHead.init_switch_prob = property(_switch_head_init_switch_prob)

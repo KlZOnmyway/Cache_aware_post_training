@@ -41,6 +41,8 @@ controller:
   cache_cap: 30
   budget_fraction: 0.7                          # total_credits = 0.7 × num_moe_layers per token
   chunk_size: 8                                 # for L_chunk_consist
+  expert_set_embed_dim: 64                      # DeepSets context dim for SwitchHead;
+                                                # 0 disables (legacy hidden+pressure-only).
 
 # ---- loss weights ----
 loss:
@@ -69,16 +71,38 @@ rollout:
   rm_url: http://localhost:30001                # teacher SGLang server
   rm_type: custom
   custom_rm_path: slime_adapter.rollout.reward_kl:reward_func
-  rollout_function_path: slime_adapter.rollout.generate:generate_rollout
+  # MiniLLM-style p_mix rollout to block reward-hacking via teacher blind spots.
+  # See docs/loss_and_reward_reference.md §0.5
+  rollout_function_path: slime_adapter.rollout.mix_generate:generate_rollout
+  teacher_mix_alpha: 0.3            # α in p_mix = (1-α)·p_S + α·p_T
+  mix_top_k: 64                     # vocab-subset cap per side (union)
+  cache_cost_lambda: 0.05           # α_c — cache cost coefficient in r_t
+  correctness_reward_alpha: 1.0     # α_q — task-correctness coefficient in r_t
+  cache_cost_cold_start_skip: 16    # don't charge cache cost for first N response tokens
+                                    # (cache is empty at t=0; charging would burn the budget
+                                    # on the trivially-required initial loads)
 
 # ---- GRPO/GSPO ----
 grpo:
   advantage_estimator: gspo
-  use_tis: true
+  use_tis: true                                 # IS correction (handles p_mix off-policy)
   num_update_epochs: 1                          # strict on-policy; raise once stable
   eps_clip: 4e-4
   entropy_coef: 0.0
-  kl_coef: 0.0
+
+# ---- OPD-sglang (teacher distillation through SGLang server) ----
+# slime supports two mutually-exclusive teacher paths (asserted by the framework):
+#   path A: --use-kl-loss + --ref-load <teacher>  → adds KL anchor in loss; needs
+#           teacher checkpoint loaded into Megatron (≈ doubles training memory)
+#   path B: --use-opd --opd-type sglang --opd-kl-coef λ → uses Sample.teacher_log_probs
+#           (we fetch from SGLang post-rollout); λ shifts advantage by reverse-KL
+# We use path B: cheap (no extra Megatron load), and teacher logprobs come from the
+# same SGLang server we already need for p_mix.
+opd:
+  use_opd: true
+  opd_type: sglang
+  opd_kl_coef: 0.05                               # β — weight on -KL(π_S ‖ π_T) in advantage
+kl_loss_coef: 0.0                                 # exclusive with opd_kl_coef
 
 # ---- optimizer ----
 optimizer:

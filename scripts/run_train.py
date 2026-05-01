@@ -26,39 +26,41 @@ import yaml
 
 
 def load_yaml(path: str) -> dict:
+    """Load YAML and substitute ``${var}`` references against any leaf scalar
+    in the file. The returned dict preserves the YAML's nested structure
+    (``cfg["model"]["hf_checkpoint"]`` etc.).
+    """
     with open(path) as f:
         cfg = yaml.safe_load(f)
-    # Resolve simple ${var} substitutions inside top-level scalar values.
-    flat = _flatten(cfg)
-    for _ in range(3):  # 3 passes is enough for our shallow refs
-        for k, v in list(flat.items()):
-            if isinstance(v, str) and "${" in v:
-                for kk, vv in flat.items():
-                    if isinstance(vv, (str, int, float)):
-                        v = v.replace(f"${{{kk}}}", str(vv))
+
+    # Build a flat lookup of leaf names → values (for ${var} resolution only).
+    flat = {}
+    def _walk(d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                _walk(v)
+            elif isinstance(v, (str, int, float, bool)):
                 flat[k] = v
-    return _unflatten(flat)
+    _walk(cfg)
 
+    def _subst(s):
+        if not isinstance(s, str) or "${" not in s:
+            return s
+        out = s
+        for _ in range(3):                                     # shallow refs only
+            for kk, vv in flat.items():
+                if isinstance(vv, (str, int, float)):
+                    out = out.replace(f"${{{kk}}}", str(vv))
+        return out
 
-def _flatten(d, prefix=""):
-    out = {}
-    for k, v in d.items():
-        key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-        if isinstance(v, dict):
-            out.update(_flatten(v, key))
-        else:
-            out[k] = v
-            out[key] = v
-    return out
-
-
-def _unflatten(flat):
-    out = {}
-    for k, v in flat.items():
-        if "." in k:
-            continue
-        out[k] = v
-    return out
+    def _walk_subst(d):
+        for k, v in list(d.items()):
+            if isinstance(v, dict):
+                _walk_subst(v)
+            elif isinstance(v, str):
+                d[k] = _subst(v)
+    _walk_subst(cfg)
+    return cfg
 
 
 def main():
@@ -155,7 +157,9 @@ def run_slime(cfg: dict) -> None:
         "--num-update-epochs", str(grpo["num_update_epochs"]),
         "--eps-clip", str(grpo["eps_clip"]),
         "--entropy-coef", str(grpo["entropy_coef"]),
-        "--kl-coef", str(grpo["kl_coef"]),
+        # OPD-sglang KL anchor (uses Sample.teacher_log_probs from mix_generate)
+        "--kl-coef", str(grpo.get("kl_coef", 0.0)),
+        "--kl-loss-coef", str(cfg.get("kl_loss_coef", 0.0)),
         # optimizer
         "--optimizer", opt["type"],
         "--lr", str(opt["lr"]),
@@ -180,6 +184,12 @@ def run_slime(cfg: dict) -> None:
     if rollout.get("use_routing_replay"): args_list.append("--use-routing-replay")
     if rollout.get("disable_cuda_graph"): args_list.append("--disable-cuda-graph")
     if grpo.get("use_tis"): args_list.append("--use-tis")
+    # OPD path B (sglang teacher) — slime asserts mutual exclusivity with --use-kl-loss.
+    opd_cfg = cfg.get("opd", {}) or {}
+    if opd_cfg.get("use_opd"):
+        args_list.append("--use-opd")
+        args_list.extend(["--opd-type", str(opd_cfg.get("opd_type", "sglang"))])
+        args_list.extend(["--opd-kl-coef", str(opd_cfg.get("opd_kl_coef", 0.0))])
     if infra.get("colocate"): args_list.append("--colocate")
     if infra.get("accumulate_allreduce_grads_in_fp32"):
         args_list.append("--accumulate-allreduce-grads-in-fp32")
