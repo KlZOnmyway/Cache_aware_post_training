@@ -25,20 +25,21 @@ Advantage (slime, GRPO):
 
 Loss (Megatron training step):
     L  =  L_PG_token                                                  ← slime PG (token actor)
-        + β · D_KL(π_θ ∥ π_ref)                                        ← slime KL anchor (teacher)
+        + β · KL_advantage_shift                                       ← slime OPD-sglang KL anchor
         + λ_pg_s · L_switch_pg                                         ← OUR joint-actor PG (SwitchHead)
         + λ_h    · L_barrier                                           ← OUR hinge² overflow cap
         + λ_chunk · L_chunk_consistency                                ← OUR routing smoothness
 
-  L_switch_pg  =  − E[ A_t · Σ_l logπ(switch_{t,l}; σ_{t,l}) ]
+  L_switch_pg  =  − E_i[ A_i · mean_t(Σ_l logπ(switch_{t,l}; σ_{t,l})) ]
   L_barrier    =  E[ max(0, used_t − budget)² ]
   L_chunk_*    =  routing-distribution smoothness across consecutive token chunks
 ```
 
-KL appears **once**, in the loss as the standard slime ref-KL anchor. The
-distillation signal is implemented through `--ref-load <teacher>` +
-`--use-kl-loss` + `--kl-loss-coef`. There is no separate
-`−λ_d · D_KL_to_teacher` term in the reward.
+KL appears **once**, via slime's OPD-sglang path (`--use-opd --opd-type sglang
+--opd-kl-coef β`). Teacher logprobs come from the SGLang teacher server
+(fetched post-rollout by `mix_generate._fetch_teacher_logprobs_full`) and
+are stored on `Sample.teacher_log_probs`. slime shifts the advantage by
+`−β·KL(π_S ‖ π_T)`. There is no separate KL term in the reward.
 
 ---
 
@@ -54,10 +55,9 @@ where ``rollout_log_probs`` is whatever the rollout function recorded as the
     which is exactly the IS correction p_mix sampling needs.
 
 So **no extra metadata transfer is required** — slime's native TIS path
-handles p_mix-side IS correction for free. This replaces the earlier
-`_apply_importance_weights_inplace` hack (now removed: `Sample.metadata` is
-not propagated by `slime/ray/rollout.py:_get_train_data` anyway, so the hack
-was dead code).
+handles p_mix-side IS correction for free. (Note: `Sample.metadata` is
+not propagated by `slime/ray/rollout.py:_get_train_data`, so any
+metadata-based IS approach would have been dead code.)
 
 ## 0.5. Sampling distribution: p_mix (MiniLLM-style)
 
@@ -174,7 +174,7 @@ total_loss  =  base_loss                         (slime: PG_token + ref-KL ancho
 | Sub-term | What | Where computed | Inputs |
 |----------|------|----------------|--------|
 | **Token PG** `−E[ratio · clip(A_t)]` | clipped GRPO/GSPO actor on the LM head | `external/slime/slime/backends/megatron_utils/loss.py:794+` (`policy_loss_function`) inside `pg_loss = compute_policy_loss(...)` | `batch["log_probs"]` (current), `batch["rollout_log_probs"]`, `batch["advantages"]` |
-| **KL anchor** `β · D_KL(π_θ ‖ π_ref)` | distillation to frozen teacher | same file `:956+`, gated by `args.use_kl_loss`; `kl_loss_coef * kl_loss` added to the loss | `batch["ref_log_probs"]` (computed from `--ref-load <teacher>` checkpoint) |
+| **OPD-sglang KL** `β · advantage shift` | distillation to frozen teacher | same file `:560+`, `apply_opd_kl_to_advantages` (gated by `args.use_opd`); subtracts `β·KL(π_S ‖ π_T)` from per-token advantage | `Sample.teacher_log_probs` (fetched post-rollout from SGLang teacher) |
 | **Entropy** `−c_ent · H(π_θ)` | optional exploration bonus | same file, gated by `args.entropy_coef` | `log_probs`, derived `entropy` |
 | **TIS / OPSM** | off-policy correction (only when K>1) | same file `:870+` | `batch["rollout_log_probs"]` |
 
@@ -186,16 +186,27 @@ flows through `A_t`.
 ### Term 2.2 — `L_switch_pg` (our joint-actor PG term)
 
 ```python
-# slime_adapter/loss/penalty_loss.py: _wrapped_policy_loss
+# slime_adapter/loss/penalty_loss.py: _compute_switch_pg
 slp = summary.switch_logprob_per_token              # [B, T] — Σ_l logπ(switch)
-adv = _extract_advantages(batch)                    # [B, T] from batch["advantages"]
-L_switch_pg = -(adv * slp).mean()                   # − E[A_t · Σ logπ_switch]
+advs = batch["advantages"]                          # list of 1D tensors (per-sample, response-only)
+
+# Per-sample alignment: GRPO advantages are per-trajectory constant,
+# switch_logprob is [B, T] covering full padded sequence.
+a_per_sample = [a.mean() for a in advs]             # [B] scalar per sample
+slp_per_sample = slp.mean(dim=-1)                   # [B] mean switch logprob per sample
+L_switch_pg = -(a_per_sample * slp_per_sample).mean()
 ```
 
 | Tensor | Shape | Source | Has gradient? |
 |--------|-------|--------|---------------|
 | `summary.switch_logprob_per_token` | `[B, T]` | `TokenBudgetState.charge_layer_with_logp` accumulates per-layer Bernoulli logπ. `slime_adapter/megatron_hooks/budget.py:83-109`. Calls into the layer wrapper at `slime_adapter/megatron_hooks/moe_forward_patch.py:218-220`. | **yes** — flows back through σ → SwitchHead linear |
-| `advantages` | `[B, T]` | slime's `compute_advantages_and_returns` after rewards from `post_process_rewards`. Detached at the loss boundary. | no (detached) |
+| `advantages` | `list[Tensor]` | slime's `compute_advantages_and_returns` after rewards from `post_process_rewards`. Each element is 1D (response-only, variable length). Detached at the loss boundary. | no (detached) |
+
+**Shape alignment**: slime's advantages are per-sample 1D tensors (response-only,
+variable length). `switch_logprob_per_token` is `[B, T]` (full padded sequence).
+We align them at the **per-sample** level: each sample's mean advantage × its
+mean switch_logprob. For GRPO where advantages are per-trajectory constant,
+`a.mean()` just extracts the scalar.
 
 **Gradient path**: `L_switch_pg` → `slp` → σ → `SwitchHead.linear.{weight,bias}`.
 The advantage is detached (standard PG); only the log-prob is differentiable.
@@ -313,12 +324,17 @@ Two distinct paths exist in slime; **we use exactly one**:
 
 | Path | Slime arg | Where added | Used by us? |
 |------|-----------|-------------|-------------|
-| **β: KL as loss anchor** | `--use-kl-loss --kl-loss-coef β --ref-load <teacher>` | `slime/backends/megatron_utils/loss.py:956-967` (computed from `batch["ref_log_probs"]` and added to `pg_loss`) | **yes** — set in YAML |
-| α: KL as advantage shift (OPD-reward) | `--use-opd --opd-kl-coef λ --opd-type {sglang,megatron}` | `slime/backends/megatron_utils/loss.py:apply_opd_kl_to_advantages:560+` (subtracts `λ·KL(stu‖teach)` from advantage) | not used |
+| β: KL as loss anchor | `--use-kl-loss --kl-loss-coef β --ref-load <teacher>` | `slime/backends/megatron_utils/loss.py:956-967` (computed from `batch["ref_log_probs"]` and added to `pg_loss`) | **no** — requires loading teacher into Megatron (2× memory) |
+| **β: KL as advantage shift (OPD-sglang)** | `--use-opd --opd-type sglang --opd-kl-coef β` | `slime/backends/megatron_utils/loss.py:apply_opd_kl_to_advantages:560+` (subtracts `β·KL(stu‖teach)` from advantage using `Sample.teacher_log_probs`) | **yes** — set in YAML |
 
-slime asserts only **one** of `kl_coef` / `kl_loss_coef` is non-zero
-(`slime/utils/arguments.py:1676`), so accidental double-counting is impossible
-at the framework level. Our YAML sets `kl_loss_coef > 0` and `use_opd: false`.
+slime asserts mutual exclusivity between `kl_loss_coef > 0` and `use_opd`
+(`slime/utils/arguments.py:1676`), so accidental double-counting is impossible.
+Our YAML sets `use_opd: true`, `opd_kl_coef: 0.05`, and `kl_loss_coef: 0.0`.
+
+Teacher logprobs are fetched post-rollout by
+`mix_generate._fetch_teacher_logprobs_full` (one-shot HTTP call to the teacher
+SGLang server) and stored on `Sample.teacher_log_probs`. This is the same
+SGLang server used for p_mix sampling, so no extra infra is needed.
 
 ---
 
@@ -349,34 +365,37 @@ mention K>1 as a "free bonus" — it really is once we add σ to the records.
 |-------------------|----------------|
 | `r(τ)` (trajectory reward) | `rollout/reward_kl.py:post_process_rewards` |
 | `α_q · task(τ)` | `α_q = args.correctness_reward_alpha`, `is_correct` set by user RM |
-| `α_c · Σ switch·n_new` | `_trajectory_cache_cost` reads `sample.controller_records` |
+| `α_c · Σ switch·n_new` | `rollout/reward_kl.py:trajectory_cache_cost` reads `sample.controller_records` |
 | `A_t` | slime `compute_advantages_and_returns` (GRPO group baseline) |
 | `−E[ratio·clip(A)]` | slime `compute_policy_loss` |
-| `β·D_KL(π_θ ∥ π_ref)` | slime `policy_loss_function` `args.use_kl_loss` branch |
-| `−E[A·Σ logπ_switch]` | `loss/penalty_loss.py:97-114` (`L_switch_pg`) |
-| `Σ_l logπ_switch` | `budget.py:charge_layer_with_logp:99-109` |
-| `max(0, used−budget)²` | `loss/penalty_loss.py:91` (`L_barrier`) |
+| `β·KL advantage shift` | slime OPD-sglang: `apply_opd_kl_to_advantages` using `Sample.teacher_log_probs` |
+| `−E_i[A_i · mean_t(Σ_l logπ_switch)]` | `loss/penalty_loss.py:_compute_switch_pg` |
+| `Σ_l logπ_switch` | `budget.py:charge_layer_with_logp` |
+| `max(0, used−budget)²` | `loss/penalty_loss.py:_wrapped_policy_loss` (`L_barrier`) |
 | `L_chunk_consistency` | `state.chunk_consistency_loss`, set in adapter forward |
-| `cache state ω_t` | `controller/cache_state.py:LayerCache`, per-layer rolling window |
+| `cache state ω_t` | `controller/cache_state.py:LayerCache` / `BatchedLayerCache`, per-layer rolling window |
 | `switch_{t,l}` (hard 0/1) | `controller/ste.py:ste_binary` (forward = `>0.5`, backward = identity through σ) |
 | `σ_{t,l}` | `controller/switch_head.py:SwitchHead.forward → sigmoid` |
-| `n_new_{t,l}` | `moe_forward_patch.py:_compute_n_new_batched` |
+| `n_new_{t,l}` | `moe_forward_patch.py:_batched_n_new_loop` (train) / `BatchedLayerCache.n_new` |
 
 ---
 
 ## 9. Hyper-parameters (what the YAML knobs map to)
 
-| YAML key | Used by | Symbol | Default |
-|----------|---------|--------|---------|
-| `loss.lambda_budget`  → `args.budget_lambda` | (deprecated; falls back to `cache_cost_lambda`) | — | 0.05 |
-| `reward.cache_cost_lambda` → `args.cache_cost_lambda` | `post_process_rewards` | α_c | 0.05 |
-| `reward.correctness_alpha` → `args.correctness_reward_alpha` | `post_process_rewards` | α_q | 0.0 |
-| `loss.lambda_barrier` → `args.barrier_lambda` | `_wrapped_policy_loss` | λ_h | 0.5 |
-| `loss.lambda_consistency` → `args.consistency_lambda` | `_wrapped_policy_loss` | λ_chunk | 0.05 |
-| `loss.switch_pg_lambda` → `args.switch_pg_lambda` | `_wrapped_policy_loss` | λ_s | 1.0 |
-| `controller.budget_fraction` → `args.budget_fraction` | `_resolve_total_credits` | total_credits = budget_fraction × num_moe_layers | 0.7 |
-| `grpo.kl_loss_coef` → `args.kl_loss_coef` | slime `policy_loss_function` | β | (set in YAML) |
-| `model.ref_load` → `args.ref_load` | slime model build | teacher checkpoint path | — |
+| YAML key | CLI arg | Used by | Symbol | Default |
+|----------|---------|---------|--------|---------|
+| `rollout.cache_cost_lambda` | `--cache-cost-lambda` | `post_process_rewards` | α_c | 0.0 |
+| `rollout.correctness_reward_alpha` | `--correctness-reward-alpha` | `post_process_rewards` | α_q | 0.0 |
+| `rollout.cache_cost_cold_start_skip` | `--cache-cost-cold-start-skip` | `trajectory_cache_cost` | — | 0 |
+| `rollout.teacher_mix_alpha` | `--teacher-mix-alpha` | `generate_rollout` | α | 0.5 |
+| `rollout.mix_top_k` | `--mix-top-k` | `generate_rollout` | — | 64 |
+| `loss.lambda_barrier` | `--barrier-lambda` | `_wrapped_policy_loss` | λ_h | 0.5 |
+| `loss.lambda_consistency` | `--consistency-lambda` | `_wrapped_policy_loss` | λ_chunk | 0.05 |
+| (code default) | `args.switch_pg_lambda` | `_wrapped_policy_loss` | λ_s | 1.0 |
+| `controller.budget_fraction` | `--budget-fraction` | `_resolve_total_credits` | total_credits = fraction × L | 0.7 |
+| `controller.expert_set_embed_dim` | `--expert-set-embed-dim` | `wrap_moe_layer` | — | 0 (disabled) |
+| `opd.opd_kl_coef` | `--opd-kl-coef` | slime OPD advantage shift | β | 0.0 |
+| `model.hf_checkpoint` | `--hf-checkpoint` | slime model build | — | — |
 
 ---
 

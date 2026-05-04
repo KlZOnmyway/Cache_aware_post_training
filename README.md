@@ -78,7 +78,7 @@ scripts/
   run_train.py                    # YAML → slime CLI args + run
 slime_adapter/                    # the new framework (uv workspace member)
   src/slime_adapter/...           # modules: controller / loss / rollout / megatron_hooks / sglang_patches
-  tests/                          # 35 unit + 5 GPU-only e2e tests
+  tests/                          # 33 unit + 5 GPU-only e2e tests
 docs/
   loss_and_reward_reference.md    # canonical per-term reference (file:line)
 PORT_TO_SLIME.md                  # design rationale + v4 changelog
@@ -89,7 +89,7 @@ PORT_TO_SLIME.md                  # design rationale + v4 changelog
 ```bash
 # unit + integration (no GPU, no slime needed)
 uv run --frozen --no-sync python -m pytest slime_adapter/tests/ -q
-# 35 passed, 5 skipped
+# 33 passed, 5 skipped
 
 # end-to-end against the real stack (needs GPU + ./external/* installed)
 uv run --frozen --no-sync python -m pytest slime_adapter/tests/test_real_*.py -q

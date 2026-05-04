@@ -1,20 +1,17 @@
 """Loss-side patches.
 
-Importing ``slime_adapter.loss.penalty_loss`` monkey-patches slime's
-``policy_loss_function`` to add three new terms on top of the OPD KL:
+Call ``slime_adapter.loss.penalty_loss.apply_patch()`` to monkey-patch
+slime's ``policy_loss_function`` and add aux terms on top:
 
-  - ``λ_b · uniform per-switch cost``
-  - ``λ_h · token-level hinge² barrier``
-  - ``λ_c · chunk-wise routing consistency``
+  - ``λ_s · L_switch_pg``   — joint-actor PG for SwitchHead
+  - ``λ_h · L_barrier``     — token-level hinge² barrier
+  - ``λ_c · L_chunk``       — chunk-wise routing consistency
 
-Side-effecting import: do not import this module unless you want the patch
-to apply. Typical usage::
-
-    # at the top of your train.py (after slime is importable)
-    import slime_adapter.loss.penalty_loss   # noqa: F401  (applies the patch)
+The patch is NOT auto-applied on import; it requires an explicit
+``apply_patch()`` call (done by ``spec.get_spec_with_controller``).
 """
 
-from . import penalty_loss as _penalty_loss  # noqa: F401  (patch on import)
+from . import penalty_loss as _penalty_loss  # noqa: F401
 from .chunk_consistency import (
     chunk_routing_consistency_loss,
     compute_chunk_consistency,

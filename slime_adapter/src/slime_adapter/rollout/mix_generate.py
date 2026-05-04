@@ -81,12 +81,13 @@ def sample_p_mix(
     student_top: dict,
     teacher_top: dict,
     alpha: float,
-) -> Tuple[int, float, float]:
+) -> Tuple[int, float, float, float]:
     """Form p_mix over the union of top-K supports and draw one token.
 
-    Returns ``(token_id, w_t, log_p_S)`` where:
-        w_t      = p_S(token) / p_mix(token)
-        log_p_S  = log p_S(token)   (used as ``rollout_log_probs``)
+    Returns ``(token_id, w_t, log_p_S, log_p_mix)`` where:
+        w_t       = p_S(token) / p_mix(token)
+        log_p_S   = log p_S(token)   (monitoring / diagnostics)
+        log_p_mix = log p_mix(token) (stored in rollout_log_probs for TIS)
     """
     if not student_top and not teacher_top:
         raise RuntimeError("p_mix: both top-K dicts empty; SGLang returned no logprobs")
@@ -181,7 +182,6 @@ async def generate_one_p_mix(
 # Slime entry point
 # =====================================================================
 
-from typing import Optional, Sequence  # already imported above; explicit for safety
 
 
 async def generate_rollout(args, rollout_id, data_source, evaluation: bool = False):
@@ -203,7 +203,7 @@ async def generate_rollout(args, rollout_id, data_source, evaluation: bool = Fal
     top_k = int(getattr(args, "mix_top_k", 64))
     max_new = int(getattr(args, "rollout_max_response_len", 1024))
     temperature = float(getattr(args, "rollout_temperature", 1.0))
-    eos = int(getattr(args, "eos_token_id", 0))
+    eos = int(getattr(args, "eos_token_id", 151643))  # Qwen3 <|endoftext|>
 
     student_url = "http://{}:{}/generate".format(
         getattr(args, "sglang_router_ip", "127.0.0.1"),
@@ -346,54 +346,6 @@ async def _fetch_teacher_logprobs_full(
     return vals
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
-
-def _iter_prompts(data_source) -> Iterable[dict]:
-    """Best-effort uniform iterator over slime's data_source.
-
-    Some slime data sources are simple iterables of dicts; others are
-    callable factories. We try common shapes and fall back to ``iter()``.
-    """
-    if data_source is None:
-        return iter(())
-    if callable(data_source):
-        try:
-            return iter(data_source())
-        except Exception:
-            pass
-    return iter(data_source)
-
-
-def _student_url(args) -> str:
-    host = getattr(args, "sglang_router_ip", "127.0.0.1")
-    port = getattr(args, "sglang_router_port", 30000)
-    return "http://{}:{}/generate".format(host, port)
-
-
-def _teacher_url(args) -> str:
-    url = str(getattr(args, "rm_url", ""))
-    if not url:
-        raise ValueError("--rm-url must be set to the teacher SGLang base URL")
-    if url.endswith("/generate"):
-        return url
-    return url.rstrip("/") + "/generate"
-
-
-def _iter_prompts(data_source) -> Iterable:
-    return _iter_prompts_uniform(data_source)
-
-
-def _iter_prompts_uniform(data_source) -> Iterable:
-    if data_source is None:
-        return iter([])
-    if callable(data_source):
-        try:
-            return iter(data_source())
-        except Exception:
-            return iter(data_source)
-    return iter(data_source)
 
 
 __all__ = [

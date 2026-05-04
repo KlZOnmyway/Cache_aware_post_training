@@ -49,7 +49,10 @@ class LayerCache:
         return sum(1 for e in top2 if self._counts.get(int(e), 0) == 0)
 
     def push(self, top2: Sequence[int]) -> int:
-        """Append ``top2`` to the rolling window. Returns experts evicted."""
+        """Append ``top2`` to the rolling window. Returns experts evicted.
+
+        Window-only eviction (cap dropped in v4 to match BatchedLayerCache).
+        """
         ids = tuple(int(e) for e in top2)
         evicted = 0
         if len(self._entries) >= self.window:
@@ -57,8 +60,6 @@ class LayerCache:
         self._entries.append(ids)
         for e in ids:
             self._counts[e] += 1
-        while self._distinct_size() > self.cap and self._entries:
-            evicted += self._evict_one()
         return evicted
 
     def n_new_and_push(self, top2: Sequence[int]) -> Tuple[int, int]:
@@ -151,23 +152,19 @@ class BatchedLayerCache:
     """
 
     DEFAULT_WINDOW = 16
-    DEFAULT_CAP = 30
 
     def __init__(
         self,
         num_experts: int,
         window: int = DEFAULT_WINDOW,
-        cap: int = DEFAULT_CAP,
+        cap: int = 0,
     ) -> None:
         if num_experts < 1:
             raise ValueError(f"num_experts must be >= 1, got {num_experts}")
         if window < 1:
             raise ValueError(f"window must be >= 1, got {window}")
-        if cap < 1:
-            raise ValueError(f"cap must be >= 1, got {cap}")
         self.E = int(num_experts)
         self.window = int(window)
-        self.cap = int(cap)
         self._count: "torch.Tensor | None" = None
         self._history: List["torch.Tensor"] = []
         self._batch_size: int = 0
@@ -242,10 +239,10 @@ class BatchedLayerCache:
 
     def __repr__(self) -> str:
         if self._count is None:
-            return f"BatchedLayerCache(uninitialized, window={self.window}, cap={self.cap})"
+            return f"BatchedLayerCache(uninitialized, window={self.window})"
         return (
             f"BatchedLayerCache(B={self._batch_size}, E={self.E}, "
-            f"window={self.window}, cap={self.cap}, "
+            f"window={self.window}, "
             f"history_len={len(self._history)}, "
             f"distinct_max={int((self._count > 0).sum(dim=-1).max())})"
         )

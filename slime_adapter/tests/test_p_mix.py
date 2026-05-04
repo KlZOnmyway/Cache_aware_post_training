@@ -76,52 +76,26 @@ def test_sample_p_mix_alpha_one_is_pure_teacher():
 
 
 # =============================================================================
-# Importance-weight rescaling on the loss side
+# Switch PG loss computation
 # =============================================================================
 
-def test_apply_importance_weights_direct_list():
-    from slime_adapter.loss.penalty_loss import _apply_importance_weights_inplace
-    import torch
+def test_switch_pg_per_sample_alignment():
+    """Verify _compute_switch_pg aligns per-sample advantages with [B, T] switch logprob."""
+    from slime_adapter.loss.penalty_loss import _compute_switch_pg
+
+    zero = torch.tensor(0.0)
+    B, T = 2, 4
+
+    class FakeSummary:
+        switch_logprob_per_token = torch.randn(B, T)
 
     batch = {
-        "advantages": [
-            torch.tensor([1.0, 2.0, 3.0]),
-            torch.tensor([4.0, 5.0]),
-        ],
-        "importance_weights": [
-            torch.tensor([0.5, 1.0, 2.0]),
-            torch.tensor([1.0, 0.5]),
-        ],
+        "advantages": [torch.tensor([1.0, 1.0, 1.0]), torch.tensor([-1.0, -1.0])],
     }
-    _apply_importance_weights_inplace(None, batch)
-    assert torch.allclose(batch["advantages"][0], torch.tensor([0.5, 2.0, 6.0]))
-    assert torch.allclose(batch["advantages"][1], torch.tensor([4.0, 2.5]))
-
-
-def test_apply_importance_weights_via_sample_metadata():
-    from slime_adapter.loss.penalty_loss import _apply_importance_weights_inplace
-    import torch
-
-    class FakeSample:
-        def __init__(self, w):
-            self.metadata = {"importance_weights": w}
-
-    batch = {
-        "advantages": [torch.tensor([10.0, 20.0])],
-        "samples": [FakeSample([0.1, 0.5])],
-    }
-    _apply_importance_weights_inplace(None, batch)
-    assert torch.allclose(batch["advantages"][0], torch.tensor([1.0, 10.0]))
-
-
-def test_apply_importance_weights_no_op_when_missing():
-    from slime_adapter.loss.penalty_loss import _apply_importance_weights_inplace
-    import torch
-
-    a0 = torch.tensor([1.0, 2.0])
-    batch = {"advantages": [a0]}     # no IS info
-    _apply_importance_weights_inplace(None, batch)
-    assert torch.allclose(batch["advantages"][0], torch.tensor([1.0, 2.0]))
+    L = _compute_switch_pg(batch, FakeSummary(), zero)
+    assert L.shape == ()
+    assert L.requires_grad is False   # advantages are detached
+    assert L.item() != 0.0           # should be non-trivial
 
 
 # =============================================================================

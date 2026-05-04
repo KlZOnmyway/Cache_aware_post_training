@@ -42,15 +42,18 @@ def test_layer_cache_n_new_basic():
     assert c.n_new((6, 7)) == 2     # both new
 
 
-def test_layer_cache_cap_enforced():
-    c = LayerCache(window=4, cap=4)
-    c.push((1, 2))
-    c.push((3, 4))                  # 4 distinct, exactly cap
-    assert c.size == 4
-    c.push((5, 6))                  # 6 distinct, over cap → evict oldest entry (1, 2)
-    assert c.size == 4
+def test_layer_cache_window_only():
+    """Cap is dropped in v4; only window-based eviction."""
+    c = LayerCache(window=3, cap=99)
+    c.push((1, 2))      # entries: [(1,2)]
+    c.push((3, 4))      # entries: [(1,2), (3,4)]
+    c.push((5, 6))      # entries: [(1,2), (3,4), (5,6)] — full window
+    assert c.size == 6   # 6 distinct, no cap enforcement
+    c.push((7, 8))       # window overflow → evict (1,2); entries: [(3,4), (5,6), (7,8)]
     assert 1 not in c
-    assert 5 in c
+    assert 2 not in c
+    assert 3 in c
+    assert 7 in c
 
 
 # ------------------------------------------------------------------

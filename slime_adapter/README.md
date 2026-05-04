@@ -34,16 +34,17 @@ The full objective:
 r_t = α_q · task(t) − α_c · Σ_l switch_{t,l} · n_new_{t,l}              ← reward
 A_t = (G_t − mean_g) / std_g                                            ← GRPO group baseline
 
-L = −E[ratio_t · w_t · clip(A_t)]                  ← slime PG (with IS weight)
-  + β · D_KL(π_θ ‖ π_T)                            ← slime KL anchor (--use-kl-loss)
-  + λ_pg_s · −E[A_t · Σ_l logπ(switch_{t,l})]      ← joint actor on SwitchHead
+L = −E[ratio_t · clip(A_t)]                        ← slime PG (TIS ratio = π_θ / p_mix)
+  + β · KL advantage shift                         ← slime OPD-sglang (--use-opd)
+  + λ_pg_s · −E_i[A_i · mean_t(Σ_l logπ(switch))]  ← joint actor on SwitchHead
   + λ_h · mean(max(0, used_t − budget)²)           ← hard hinge² barrier
   + λ_chunk · L_chunk_consistency                  ← routing smoothness
 ```
 
-KL appears **only in the loss anchor** (slime ref-KL), never in the reward —
-slime asserts at most one of `--use-kl-loss` / `--use-opd` is set, so accidental
-double-counting is impossible.
+KL enters via slime's OPD-sglang path (`--use-opd --opd-type sglang`), which
+shifts the advantage by `−β·KL(π_S ‖ π_T)`. Teacher logprobs come from the
+same SGLang server used for p_mix sampling. slime asserts mutual exclusivity
+between `--use-kl-loss` and `--use-opd`, preventing double-counting.
 
 For the full term-by-term audit (file:line, gradient paths, on/off-policy
 classification, YAML knobs, sanity tests), see
@@ -73,7 +74,7 @@ slime_adapter/
 │   │   ├── mix_generate.py            p_mix rollout + IS weights
 │   │   └── generate.py                pass-through (legacy on-policy)
 │   ├── loss/
-│   │   ├── penalty_loss.py            slime PG wrapper: IS+barrier+chunk+L_switch_pg
+│   │   ├── penalty_loss.py            slime PG wrapper: barrier+chunk+L_switch_pg
 │   │   └── chunk_consistency.py
 │   └── spec.py                        Megatron --spec entrypoint
 ├── configs/qwen3_30b_a3b_*.py
@@ -89,23 +90,26 @@ rollout:
   rollout_function_path: slime_adapter.rollout.mix_generate:generate_rollout
   custom_rm_path:        slime_adapter.rollout.reward_kl:reward_func
   rm_url:                http://localhost:30001     # frozen teacher SGLang
-  teacher_mix_alpha:     0.5
+  teacher_mix_alpha:     0.3                        # α in p_mix = (1-α)·p_S + α·p_T
   mix_top_k:             64
   cache_cost_lambda:     0.05
   correctness_reward_alpha: 1.0
+  cache_cost_cold_start_skip: 16                    # don't charge first 16 response tokens
   use_routing_replay:    true                       # SGLang↔Megatron drift fix
 
 loss:
-  switch_pg_lambda: 1.0
-  barrier_lambda:   0.5
-  consistency_lambda: 0.05
+  lambda_barrier:     0.5                           # λ_h — hinge² barrier
+  lambda_consistency: 0.05                          # λ_chunk — routing smoothness
+
+opd:
+  use_opd:       true
+  opd_type:      sglang                             # teacher logprobs from SGLang server
+  opd_kl_coef:   0.05                               # β — KL advantage shift
 
 grpo:
   advantage_estimator: gspo
   num_update_epochs:   1                            # K=1 strict on-policy
-  use_tis:             true                         # off-policy correction (no-op at K=1)
-  kl_loss_coef:        0.05                         # β · D_KL(π_θ ∥ π_ref=teacher)
-  kl_coef:             0.0                          # exclusive with kl_loss_coef
+  use_tis:             true                         # IS correction (ratio = π_θ / p_mix)
 ```
 
 ## How to extend to a new MoE arch
@@ -156,8 +160,9 @@ pytest slime_adapter/tests/test_controller_core.py \
 pytest slime_adapter/tests/test_real_*  # 4 tests
 ```
 
-Status: **functional**. 21/21 unit + integration tests pass; real-stack
-end-to-end tested on 4-layer Qwen3-30B-A3B (truncated for CI) and 1× H100.
+Status: **functional**. 33/33 unit + integration tests pass (5 GPU-only e2e
+skipped); real-stack end-to-end tested on 4-layer Qwen3-30B-A3B (truncated
+for CI) and 1× H100.
 
 ## Documentation
 

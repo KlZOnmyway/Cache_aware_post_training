@@ -46,10 +46,8 @@ controller:
 
 # ---- loss weights ----
 loss:
-  lambda_budget: 0.05                           # uniform per-switch cost
   lambda_barrier: 0.5                           # token-level hinge² barrier
   lambda_consistency: 0.05                      # chunk routing smoothness
-  router_kl_anchor: 0.0                         # optional: anchor student router to teacher
 
 # ---- rollout (SGLang) ----
 rollout:

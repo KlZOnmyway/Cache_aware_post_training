@@ -175,6 +175,16 @@ def run_slime(cfg: dict) -> None:
         "--sglang-mem-fraction-static", str(sg["mem_fraction_static"]),
         "--sglang-cuda-graph-max-bs", str(sg["cuda_graph_max_bs"]),
         "--sglang-max-running-requests", str(sg["max_running_requests"]),
+        # slime_adapter controller knobs (passed through args namespace)
+        "--expert-set-embed-dim", str(ctrl.get("expert_set_embed_dim", 0)),
+        # slime_adapter rollout knobs
+        "--teacher-mix-alpha", str(rollout.get("teacher_mix_alpha", 0.5)),
+        "--mix-top-k", str(rollout.get("mix_top_k", 64)),
+        "--cache-cost-lambda", str(rollout.get("cache_cost_lambda", 0.0)),
+        "--correctness-reward-alpha", str(rollout.get("correctness_reward_alpha", 0.0)),
+        "--cache-cost-cold-start-skip", str(rollout.get("cache_cost_cold_start_skip", 0)),
+        # seed
+        "--seed", str(cfg.get("seed", 42)),
     ]
 
     if par.get("sequence_parallel"): args_list.append("--sequence-parallel")
@@ -197,6 +207,9 @@ def run_slime(cfg: dict) -> None:
         args_list.append("--attention-softmax-in-fp32")
     if infra.get("attention_backend"):
         args_list.extend(["--attention-backend", infra["attention_backend"]])
+    # SwitchHead separate LR (passed as env var; slime doesn't have a CLI arg for param-group LRs)
+    if opt.get("switch_head_lr"):
+        os.environ["SLIME_ADAPTER_SWITCH_HEAD_LR"] = str(opt["switch_head_lr"])
 
     print(f"[run_train] dispatching to slime/train.py ({len(args_list)} CLI args)")
     print(f"[run_train] cmd: python {train_py} {' '.join(shlex.quote(a) for a in args_list[:8])} ...")

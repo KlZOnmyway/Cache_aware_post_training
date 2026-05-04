@@ -46,8 +46,11 @@ async def reward_func(args, sample, **kwargs):
         "sampling_params": {"max_new_tokens": 0, "temperature": 1.0},
         "return_logprob": True,
     }
+    url = str(args.rm_url).rstrip("/")
+    if not url.endswith("/generate"):
+        url = url + "/generate"
     async with aiohttp.ClientSession() as session:
-        async with session.post(args.rm_url, json=payload) as resp:
+        async with session.post(url, json=payload) as resp:
             resp.raise_for_status()
             data = await resp.json()
     return data
@@ -127,9 +130,8 @@ def attach_teacher_logprobs(sample) -> None:
 
 
 def _stash_teacher_logprobs(sample) -> None:
-    raw = (getattr(sample, "_raw_reward_response", None)
-           or getattr(sample, "raw_reward", None))
-    if not raw:
+    raw = getattr(sample, "reward", None)
+    if not raw or not isinstance(raw, dict):
         return
     try:
         # SGLang OPD-style payload: meta_info.input_token_logprobs is

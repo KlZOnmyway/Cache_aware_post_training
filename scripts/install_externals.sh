@@ -70,7 +70,7 @@ for arg in "$@"; do
 done
 
 if [ "${MEGATRON_LM_PATH:-}" = "" ] && [ "${want_megatron}" = "1" ]; then
-    clone_or_update "${MEGATRON_REPO}" "${MEGATRON_REF:-${MEGATRON_REF:-main}}" "${EXTERNALS}/Megatron-LM"
+    clone_or_update "${MEGATRON_REPO}" "${EXTERNALS}/Megatron-LM" "${MEGATRON_REF:-main}"
     # Megatron-LM does not ship a setup.py for plain pip; it's expected to be
     # on PYTHONPATH instead. Slime's docker image sets MEGATRON_LM_PATH.
     echo "Megatron-LM at ${EXTERNALS}/Megatron-LM (set MEGATRON_LM_PATH=$(realpath "${EXTERNALS}/Megatron-LM") in your shell)"

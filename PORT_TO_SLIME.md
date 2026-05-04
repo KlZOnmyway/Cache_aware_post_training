@@ -2,13 +2,13 @@
 
 > **v4 修订（当前实现，vs v3）—— 把"带正则的监督蒸馏"纠正回真 RL**
 >
-> 1. **Cache state ω_t 进 MDP**：每层 rolling 16-token cache（cap=30）作为 Markov 状态。switch action 物理改变 ω_{t+1}，进而影响未来 reward。
+> 1. **Cache state ω_t 进 MDP**：每层 rolling 16-token cache（window-only, 无 cap）作为 Markov 状态。switch action 物理改变 ω_{t+1}，进而影响未来 reward。
 > 2. **Cache cost 进 REWARD（不再进 loss）**：`r_t = α_q·task − α_c·Σ_l switch_{t,l}·n_new_{t,l}`。GRPO advantage A_t 把"future expert reuse 节省的成本"反向传回 t 时刻的 switch action。
 > 3. **GRPO 联合 actor**：策略 `π_θ(token, switch_1..L | s_t)`。Loss patch 多一项 `L_switch_pg = −E[A_t · Σ_l logπ(switch_{t,l})]`，给 SwitchHead 真正的 PG 梯度。STE 仍用于 forward 的硬决策。
 > 4. **MiniLLM p_mix rollout**：student 从 `(1−α)·π_S + α·π_T` 采样；per-token IS 权重 `w_t = p_S/p_mix` 在 loss 端乘进 advantage。是 KL anchor 防不住的 token-空间 reward hacking 的解。
 > 5. **SwitchHead + DeepSets context**：每层挂 `ExpertSetEncoder`（`Embedding(E, d) → φ MLP → mean-pool`），把当前 cache mask + router top-K 编成 set rep 喂给 SwitchHead，让它直接看到"现在切要付几张票"。`expert_set_embed_dim>0` 启用。
 > 6. **`BatchedLayerCache`**：cache 改成 `[B, num_experts]` 计数张量 + per-batch history deque，每个 batch 行独立。`n_new` 在每个 (b,t) 上精确，不再"全 batch 共享 union"近似。
-> 7. **KL anchor 在 loss 里（不进 reward）**：用 slime 原生 `--use-kl-loss --kl-loss-coef β --ref-load <teacher>`。slime 自身 assert 不能同时和 `--use-opd` 一起开，避免双计。
+> 7. **KL anchor 在 advantage 里（OPD-sglang, 不进 reward）**：用 slime 原生 `--use-opd --opd-type sglang --opd-kl-coef β`。teacher logprobs 从 SGLang server 获取，β·KL 从 advantage 中扣减。不需额外加载 teacher 到 Megatron。
 > 8. **RoutingReplay 留下来**：消除 SGLang ↔ Megatron 之间 router top-K 数值翻转。K=1 单轮也必须开。
 >
 > 完整 loss + reward + 文件:行号见 [`docs/loss_and_reward_reference.md`](docs/loss_and_reward_reference.md)。`PORT_TO_SLIME.md` 是高层架构 / 文件分工 / 里程碑 / 风险。
@@ -60,8 +60,8 @@ switch_l   = STE(σ_l)                              # forward I[σ>0.5], backwar
 used_top_k = switch_l ? new_top_k : current_top_k
 n_new      = |used_top_k \ ω_t|                    # 0..k
 
-# 推 cache（per-batch 独立, BatchedLayerCache）
-ω_{t+1}    = window-rolling(ω_t ∪ used_top_k, cap=30)
+# 推 cache（per-batch 独立, BatchedLayerCache, window-only eviction）
+ω_{t+1}    = window-rolling(ω_t ∪ used_top_k, window=16)
 
 # 累计预算账（per token, 跨层加和, layer 0 进入时 reset）
 used_credits_{t,l+1} = used_credits_{t,l} + switch_l · n_new_{t,l}
@@ -81,18 +81,17 @@ KL_to_teacher **不进 reward**——它通过 slime 的 `--use-kl-loss + --ref-
 
 ```
 L  =  L_PG_token                                                ← slime PG（token 维 actor）
-    + β · D_KL(π_θ ‖ π_T)                                       ← slime KL anchor (--use-kl-loss)
-    + λ_pg_s · −E[ A_t · Σ_l logπ(switch_{t,l}; σ_{t,l}) ]      ← 联合 actor PG（SwitchHead）
+    + β · KL advantage shift                                     ← slime OPD-sglang (--use-opd)
+    + λ_pg_s · −E_i[ A_i · mean_t(Σ_l logπ(switch_{t,l})) ]     ← 联合 actor PG（SwitchHead）
     + λ_h    · mean( max(0, used_t − total_credits)² )           ← 硬 hinge² barrier
     + λ_chunk · L_chunk_consistency                              ← router 时序平滑
 
 A_t  = (R_τ − mean_g R) / std_g R                                ← GRPO group baseline
-ratio_t = exp( logπ_θ(token_t) − logπ_θ_old(token_t) ) · w_t     ← p_mix IS 校正
+ratio_t = exp( logπ_θ(token_t) − log p_mix(token_t) )             ← TIS IS 校正（slime 原生）
 ```
 
-`w_t = p_S / p_mix` 在 loss patch 入口处直接乘进 `batch.advantages`（见
-`slime_adapter/loss/penalty_loss.py:_apply_importance_weights_inplace`），所以
-slime 自带的 token PG / KL anchor / TIS 都自动拿到 IS-校正后的 advantage。
+`log p_mix` 存入 `Sample.rollout_log_probs`，slime 的 TIS 自动计算
+`ratio = π_θ / p_mix`，即 IS 校正。不需要通过 metadata 传 IS 权重。
 
 ### 1.4 关键梯度路径
 
@@ -113,10 +112,10 @@ slime 自带的 token PG / KL anchor / TIS 都自动拿到 IS-校正后的 advan
 | 范式 | 监督蒸馏 + 正则 | RL（GRPO actor + group baseline） |
 | Cache cost 位置 | loss 项 `λ_b · Σ switch·n_new` | reward 项 `−α_c · Σ switch·n_new` |
 | SwitchHead 梯度来源 | STE 通过 KL 一条 | PG（A_t · logπ） + STE × KL + barrier 三条 |
-| Cache 实现 | 单 trajectory 的 Python deque, batch 共享 union | `BatchedLayerCache`（[B, E] 张量, per-batch 独立） |
+| Cache 实现 | 单 trajectory 的 Python deque, batch 共享 union | `BatchedLayerCache`（[B, E] 张量, per-batch 独立, window-only） |
 | SwitchHead 输入 | (h, pressure) | (h, pressure) + DeepSets(cache_mask, top_k) |
-| Rollout | 纯 student | MiniLLM p_mix(α=0.5) + per-token IS 权重 |
-| KL 信号 | reward + loss 都有（双计） | 只在 loss anchor（slime --use-kl-loss）|
+| Rollout | 纯 student | MiniLLM p_mix(α=0.3) + log p_mix → TIS IS 校正 |
+| KL 信号 | reward + loss 都有（双计） | OPD-sglang advantage shift（slime --use-opd）|
 | Cache 与训练 forward 一致性 | 不严格 | RoutingReplay 强制 SGLang↔Megatron top-K 一致 |
 
 ---

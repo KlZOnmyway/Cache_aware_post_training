@@ -81,8 +81,8 @@ class ExpertSetEncoder(nn.Module):
         valid = idx >= 0                                       # [..., k] bool
         safe = idx.clamp(min=0, max=self.expert_embedding.num_embeddings - 1)
         emb = self.expert_embedding(safe)                      # [..., k, embed_dim]
-        emb = emb * valid.unsqueeze(-1).to(emb.dtype)          # zero invalid
         phi_emb = self.phi(emb)                                # [..., k, set_dim]
+        phi_emb = phi_emb * valid.unsqueeze(-1).to(phi_emb.dtype)  # zero invalid AFTER phi
         if self.pool_mode == "sum":
             return phi_emb.sum(dim=-2)
         denom = valid.sum(dim=-1, keepdim=True).clamp_min(1).to(phi_emb.dtype)
