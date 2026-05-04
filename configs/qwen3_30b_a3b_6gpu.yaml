@@ -1,0 +1,152 @@
+# Cache-aware MoE distillation — Qwen3-30B-A3B / 6-GPU config
+# ============================================================================
+# Layout: 4 GPUs training (EP=4, colocate student) + 2 GPUs teacher (TP=2).
+#
+#   GPU 0-3: Megatron training + SGLang student (colocated, time-shared)
+#   GPU 4-5: SGLang teacher (frozen Qwen3-30B-A3B, TP=2, standalone)
+#
+# Memory per training GPU (EP=4, 32 experts/GPU):
+#   weights ~20GB + LoRA/optim ~1GB + activations ~4-8GB + SGLang KV ~4GB ≈ 30GB
+#   → fits H100-80G comfortably; fits 5090-32G with reduced KV cache.
+#
+# Teacher GPU (TP=2):
+#   ~30GB bf16 weights → fits H100-80G; for 5090-32G use int8 or TP=4.
+#
+# Launch:
+#   # 1. start teacher on GPU 4-5 (separate process)
+#   CUDA_VISIBLE_DEVICES=4,5 python -m sglang.launch_server \
+#       --model-path /scratch/models/Qwen3-30B-A3B \
+#       --tp 2 --port 30001 --mem-fraction-static 0.85
+#
+#   # 2. start training on GPU 0-3
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/launch_train.sh configs/qwen3_30b_a3b_6gpu.yaml
+# ============================================================================
+
+run_name: qwen3_30b_a3b_cache_distill_6gpu
+seed: 42
+output_dir: /scratch/runs/${run_name}
+tensorboard_dir: ${output_dir}/tb
+
+# ---- model ----
+model:
+  arch: qwen3_moe
+  hf_checkpoint: /scratch/models/Qwen3-30B-A3B
+  ref_load: /scratch/models/Qwen3-30B-A3B_mcore
+  dtype: bfloat16
+
+# ---- parallelism (Megatron) ----
+parallel:
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 4                 # 128/4 = 32 experts per GPU
+  expert_tensor_parallel_size: 1
+  context_parallel_size: 1
+  sequence_parallel: true
+  moe_token_dispatcher_type: alltoall
+  recompute_granularity: selective
+  use_dynamic_batch_size: true
+  max_tokens_per_gpu: 2048                      # reduced vs 8-GPU (fewer GPUs → less aggregate memory)
+
+# ---- controller knobs (slime_adapter) ----
+controller:
+  moe_arch: qwen3_moe
+  top_k: 2
+  gate_init_bias: -2.0
+  use_pressure_input: true
+  cache_window: 16
+  cache_cap: 30
+  budget_fraction: 0.7
+  chunk_size: 8
+  expert_set_embed_dim: 64
+
+# ---- LoRA (expert FFN) ----
+# Custom LoRALinear wrapping mcore ColumnParallelLinear/RowParallelLinear.
+# When lora_r > 0, run_train.py auto-passes --only-train-params-name-list
+# to slime for parameter freezing.
+lora:
+  lora_r: 8
+  lora_alpha: 16
+
+# ---- loss weights ----
+loss:
+  lambda_barrier: 0.5
+  lambda_consistency: 0.05
+
+# ---- rollout (SGLang) ----
+rollout:
+  prompt_data: /scratch/data/dapo-math-17k.jsonl
+  input_key: prompt
+  label_key: label
+  apply_chat_template: true
+  rollout_shuffle: true
+  rollout_batch_size: 4                         # halved vs 8-GPU (4 GPUs → half throughput)
+  n_samples_per_prompt: 4
+  rollout_max_response_len: 1024
+  rollout_temperature: 1.0
+  global_batch_size: 16                         # halved vs 8-GPU (fewer GPUs → smaller batch)
+  num_rollout: 1000
+  use_routing_replay: true
+  rollout_num_gpus: 4                           # student uses training GPUs (colocate)
+  rollout_num_gpus_per_engine: 2                # 2 engines × 2 GPUs each
+  disable_cuda_graph: true
+  rm_url: http://localhost:30001                # teacher SGLang on GPU 4-5
+  rm_type: custom
+  custom_rm_path: slime_adapter.rollout.reward_kl:reward_func
+  rollout_function_path: slime_adapter.rollout.mix_generate:generate_rollout
+  teacher_mix_alpha: 0.3
+  mix_top_k: 64
+  cache_cost_lambda: 0.05
+  correctness_reward_alpha: 1.0
+  cache_cost_cold_start_skip: 16
+
+# ---- GRPO/GSPO ----
+grpo:
+  advantage_estimator: gspo
+  use_tis: true
+  num_update_epochs: 1
+  eps_clip: 4e-4
+  entropy_coef: 0.0
+
+# ---- OPD-sglang ----
+opd:
+  use_opd: true
+  opd_type: sglang
+  opd_kl_coef: 0.05
+kl_loss_coef: 0.0
+
+# ---- optimizer ----
+optimizer:
+  type: adam
+  lr: 1e-6
+  lora_lr: 1e-5
+  router_lr: 1e-5
+  controller_lr: 1e-4
+  lr_decay_style: constant
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  clip_grad: 1.0
+
+# ---- distributed infra ----
+infra:
+  num_nodes: 1
+  num_gpus_per_node: 4                          # only 4 GPUs for training (GPU 0-3)
+  colocate: true
+  accumulate_allreduce_grads_in_fp32: true
+  attention_softmax_in_fp32: true
+  attention_backend: flash
+
+# ---- sglang specific ----
+sglang:
+  mem_fraction_static: 0.7                      # reduced vs 8-GPU (leave room for training activations)
+  cuda_graph_max_bs: 0
+  max_running_requests: 64                      # reduced (fewer GPUs → less concurrency)
+  teacher_url: http://localhost:30001
+
+# ---- logging / checkpointing ----
+logging:
+  backend: tensorboard
+  log_dir: ${tensorboard_dir}
+  log_interval: 10
+  save_interval: 100
+  save_dir: ${output_dir}/checkpoints
