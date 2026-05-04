@@ -70,7 +70,8 @@ def install_controller_into_layers(
 
     Reads from ``args``:
       gate_init_bias (default -2.0), cache_window (16), cache_cap (30),
-      use_pressure_input (True), budget_fraction (0.7).
+      use_pressure_input (True), budget_fraction (0.7),
+      lora_r (0 = disabled), lora_alpha (16).
 
     Stores on ``model``:
       _slime_adapter_budget: LayerBudgetTracker
@@ -84,6 +85,8 @@ def install_controller_into_layers(
     set_dim = int(getattr(args, "expert_set_embed_dim", 0))     # 0 = disable DeepSets ctx
     chunk_size = int(getattr(args, "chunk_size", 8))             # for L_chunk_consistency
     chunk_consistency_enabled = bool(getattr(args, "chunk_consistency_enabled", True))
+    lora_r = int(getattr(args, "lora_r", 0))                    # 0 = no LoRA
+    lora_alpha = int(getattr(args, "lora_alpha", 16))
 
     handles = list(adapter.iter_moe_layers(model))
     if not handles:
@@ -108,6 +111,19 @@ def install_controller_into_layers(
             chunk_size=chunk_size,
             chunk_consistency_enabled=chunk_consistency_enabled,
         )
+
+    # LoRA on expert FFN layers + router unfreezing.
+    # Parameter freezing is handled by slime's --only-train-params-name-list
+    # in the production path; freeze_base_params is only needed for standalone
+    # training (smoke tests without slime).
+    if lora_r > 0:
+        from slime_adapter.modeling.lora import (
+            apply_expert_lora,
+            patch_router_gate_recompute,
+        )
+        apply_expert_lora(model, adapter, r=lora_r, alpha=lora_alpha)
+        patch_router_gate_recompute(model, adapter)
+
     return handles
 
 

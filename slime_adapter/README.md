@@ -2,7 +2,7 @@
 
 Cache-aware MoE post-training adapter, plugged into [THUDM/slime](https://github.com/THUDM/slime) without forking it.
 
-We train an MoE student (reference: Qwen3-30B-A3B) under GRPO/GSPO with **five
+We train an MoE student (reference: Qwen3-30B-A3B) under GRPO/GSPO with **six
 modifications** that turn vanilla RL into cache-aware RL:
 
 1. **Per-layer rolling expert cache as MDP state ω_t** — implemented as a
@@ -26,6 +26,15 @@ modifications** that turn vanilla RL into cache-aware RL:
    router top-K candidates into fixed-dim set embeddings, fed into
    SwitchHead alongside `(hidden, pressure)`. So σ can condition directly on
    "what would I pay if I switched right now".
+6. **Expert LoRA + router training** (`modeling/lora.py`). LoRA adapters
+   (r=8, α=16) on each expert's `linear_fc1`/`linear_fc2` allow expert
+   specialization without full-parameter training. Router weights are
+   unfrozen (float32) so gradient flows from LM loss through RoutingReplay's
+   differentiable gate weights. Parameter freezing uses slime's standard
+   `--only-train-params-name-list` mechanism. Custom `LoRALinear` wrapper is
+   needed because mcore `ColumnParallelLinear`/`RowParallelLinear` return
+   `(output, bias)` tuples — neither Megatron-LM nor peft provide native
+   LoRA for mcore layers.
 
 
 The full objective:
@@ -62,6 +71,7 @@ slime_adapter/
 │   │   └── credits.py                 scalar credit accountant (rollout)
 │   ├── modeling/
 │   │   ├── _base.py                   abstract MoEModelAdapter
+│   │   ├── lora.py                    LoRALinear + apply/freeze/param_groups
 │   │   └── qwen3_moe/                 Qwen3-MoE concrete impl
 │   ├── megatron_hooks/
 │   │   ├── moe_forward_patch.py       per-layer forward wrapper
@@ -78,7 +88,7 @@ slime_adapter/
 │   │   └── chunk_consistency.py
 │   └── spec.py                        Megatron --spec entrypoint
 ├── configs/qwen3_30b_a3b_*.py
-└── tests/                             21 unit + 7 p_mix + integration tests
+└── tests/                             21 unit + 7 p_mix + 7 lora + integration tests
 ```
 
 ## Wiring (production config)
@@ -86,6 +96,10 @@ slime_adapter/
 The shipped `configs/qwen3_30b_a3b_8gpu.yaml` plugs everything in:
 
 ```yaml
+lora:
+  lora_r:     8                                     # LoRA rank; 0 = disable
+  lora_alpha: 16                                    # scaling = α/r = 2.0
+
 rollout:
   rollout_function_path: slime_adapter.rollout.mix_generate:generate_rollout
   custom_rm_path:        slime_adapter.rollout.reward_kl:reward_func
@@ -100,6 +114,11 @@ rollout:
 loss:
   lambda_barrier:     0.5                           # λ_h — hinge² barrier
   lambda_consistency: 0.05                          # λ_chunk — routing smoothness
+
+optimizer:
+  lora_lr:       1e-5                               # LoRA A/B
+  router_lr:     1e-5                               # router (float32)
+  controller_lr: 1e-4                               # SwitchHead + ExpertSetEncoder
 
 opd:
   use_opd:       true
@@ -154,13 +173,14 @@ pytest tests/test_controller_core.py tests/test_p_mix.py
 # unit + integration (no GPU, no real slime/sglang)
 pytest slime_adapter/tests/test_controller_core.py \
        slime_adapter/tests/test_integration_mock.py \
-       slime_adapter/tests/test_p_mix.py
+       slime_adapter/tests/test_p_mix.py \
+       slime_adapter/tests/test_lora.py
 
 # real-stack end-to-end (needs slime + Megatron + sglang installed)
 pytest slime_adapter/tests/test_real_*  # 4 tests
 ```
 
-Status: **functional**. 33/33 unit + integration tests pass (5 GPU-only e2e
+Status: **functional**. 40/40 unit + integration tests pass (5 GPU-only e2e
 skipped); real-stack end-to-end tested on 4-layer Qwen3-30B-A3B (truncated
 for CI) and 1× H100.
 

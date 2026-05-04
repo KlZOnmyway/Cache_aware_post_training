@@ -244,6 +244,53 @@ Set by the model adapter during forward (`modeling/_base.py:63`,
 |-------|--------|-------|
 | `state.chunk_consistency_loss` | `slime_adapter/loss/chunk_consistency.py` | scalar tensor, set by adapter inside the wrapped layer forward |
 
+### 2.5 — LoRA on expert FFN + router training
+
+When `lora_r > 0` (YAML `lora.lora_r`), the following are applied at model
+construction time by `install_controller_into_layers`:
+
+1. **Expert LoRA** (`modeling/lora.py:apply_expert_lora`): wraps each expert's
+   `linear_fc1` / `linear_fc2` with `LoRALinear(base, r, alpha)`. Custom
+   wrapper is necessary because mcore's `ColumnParallelLinear` /
+   `RowParallelLinear` return `(output, bias)` tuples — neither Megatron-LM
+   nor HuggingFace peft provide native LoRA for mcore layers. Init: A ~
+   Kaiming, B = 0 → zero delta at cold-start.
+
+2. **Router unfreezing** (`modeling/lora.py:patch_router_gate_recompute`):
+   unfreezes router params and converts to float32 (bf16 rounds gradient
+   updates to zero at lr ≤ 1e-5).
+
+3. **Parameter freezing** via slime's standard `--only-train-params-name-list`
+   (regex-based, `slime/backends/megatron_utils/model_provider.py:freeze_model_params`).
+   `run_train.py` auto-passes patterns `lora_ switch_head expert_set_encoder router`
+   when LoRA is enabled. Only these components receive gradient; all base
+   model params are frozen.
+
+4. **Per-component learning rates** (`modeling/lora.py:collect_param_groups`):
+   LoRA A/B → `lora_lr`, router → `router_lr` (float32), SwitchHead +
+   ExpertSetEncoder → `controller_lr`.
+
+#### Router gradient sources
+
+The router gets gradient from **two paths** (neither is blocked by
+RoutingReplay):
+
+| Path | Signal | Mechanism |
+|------|--------|-----------|
+| **LM loss → gate weight recomputation** (primary) | Task performance | RoutingReplay replays **indices** (discrete, no grad) but **recomputes gate weights** from the current router: `probs = scores.gather(1, replayed_indices)`. `scores` = `softmax(F.linear(h, router.weight))` — fully differentiable. LM loss → `expert_output × probs` → `probs` → `scores` → `router.weight`. |
+| **L_chunk_consistency** (auxiliary, λ=0.05) | Temporal smoothness | `compute_router_top_k` computes `logits = F.linear(h, router.weight)` → full `[B, T, E]` logits cached on `moe_module._slime_router_logits` → `chunk_routing_consistency_loss` uses `softmax(logits)` in a within-chunk KL → gradient flows to `router.weight`. |
+
+Key code paths:
+- `slime/utils/routing_replay.py:67-71`: `probs = scores.gather(1, top_indices)` — gate weights are differentiable
+- `megatron/core/transformer/moe/moe_utils.py:719-720`: `scores = softmax(logits)` → `compute_topk(scores, ...)` — router logits enter the replay path
+- `modeling/qwen3_moe/adapter.py:86-88`: `logits = F.linear(h, weight)` — separate top-k computation for chunk loss
+
+**What the router learns**: given replayed expert indices, the router adjusts
+gate **magnitudes** (relative weighting of selected experts) to minimize LM
+loss. It does NOT directly learn which experts to select (selection is fixed
+by replay) — but the updated router is used for selection in the **next
+rollout iteration**, creating an indirect feedback loop.
+
 ---
 
 ## 3. Forward path: where every variable on `state` is born

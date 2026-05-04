@@ -44,6 +44,15 @@ controller:
   expert_set_embed_dim: 64                      # DeepSets context dim for SwitchHead;
                                                 # 0 disables (legacy hidden+pressure-only).
 
+# ---- LoRA (expert FFN) ----
+# Custom LoRALinear wrapping mcore ColumnParallelLinear/RowParallelLinear.
+# (Megatron-LM has no native LoRA; peft is incompatible with mcore layers.)
+# When lora_r > 0, run_train.py auto-passes --only-train-params-name-list
+# to slime for parameter freezing (trains only lora_/switch_head/expert_set_encoder/router).
+lora:
+  lora_r: 8                                     # LoRA rank; 0 = disable LoRA (full-param training)
+  lora_alpha: 16                                # effective scaling = alpha/r = 2.0
+
 # ---- loss weights ----
 loss:
   lambda_barrier: 0.5                           # token-level hinge² barrier
@@ -105,8 +114,10 @@ kl_loss_coef: 0.0                                 # exclusive with opd_kl_coef
 # ---- optimizer ----
 optimizer:
   type: adam
-  lr: 1e-6                                      # router / lm_head
-  switch_head_lr: 1e-4                          # SwitchHead (small head, larger lr OK)
+  lr: 1e-6                                      # base lr (unused params with LoRA enabled)
+  lora_lr: 1e-5                                 # LoRA A/B adapters
+  router_lr: 1e-5                               # router weights (float32 for precision)
+  controller_lr: 1e-4                           # SwitchHead + ExpertSetEncoder
   lr_decay_style: constant
   weight_decay: 0.0
   adam_beta1: 0.9

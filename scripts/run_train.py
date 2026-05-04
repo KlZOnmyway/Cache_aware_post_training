@@ -176,6 +176,8 @@ def run_slime(cfg: dict) -> None:
         "--sglang-cuda-graph-max-bs", str(sg["cuda_graph_max_bs"]),
         "--sglang-max-running-requests", str(sg["max_running_requests"]),
         # slime_adapter controller knobs (passed through args namespace)
+        "--lora-r", str(cfg.get("lora", {}).get("lora_r", 0)),
+        "--lora-alpha", str(cfg.get("lora", {}).get("lora_alpha", 16)),
         "--expert-set-embed-dim", str(ctrl.get("expert_set_embed_dim", 0)),
         # slime_adapter rollout knobs
         "--teacher-mix-alpha", str(rollout.get("teacher_mix_alpha", 0.5)),
@@ -207,9 +209,19 @@ def run_slime(cfg: dict) -> None:
         args_list.append("--attention-softmax-in-fp32")
     if infra.get("attention_backend"):
         args_list.extend(["--attention-backend", infra["attention_backend"]])
-    # SwitchHead separate LR (passed as env var; slime doesn't have a CLI arg for param-group LRs)
-    if opt.get("switch_head_lr"):
-        os.environ["SLIME_ADAPTER_SWITCH_HEAD_LR"] = str(opt["switch_head_lr"])
+    # Parameter freezing via slime's regex mechanism (freeze everything except
+    # LoRA adapters, controller heads, and router weights).
+    lora_r_val = cfg.get("lora", {}).get("lora_r", 0)
+    if lora_r_val > 0:
+        args_list.extend([
+            "--only-train-params-name-list",
+            "lora_", "switch_head", "expert_set_encoder", "router",
+        ])
+    # Per-component LRs (passed as env vars; slime doesn't have CLI args for param-group LRs)
+    for key in ("lora_lr", "router_lr", "controller_lr"):
+        val = opt.get(key)
+        if val:
+            os.environ[f"SLIME_ADAPTER_{key.upper()}"] = str(val)
 
     print(f"[run_train] dispatching to slime/train.py ({len(args_list)} CLI args)")
     print(f"[run_train] cmd: python {train_py} {' '.join(shlex.quote(a) for a in args_list[:8])} ...")
